@@ -8,7 +8,6 @@ pub struct Args {
     pub bind_address: String,
     pub num_dealers: usize,
     pub num_messages_per_dealer: usize,
-    pub payload_size: usize,
     pub hwm: Option<i32>,
 }
 
@@ -84,28 +83,21 @@ pub async fn run_async(
 
         let total_messages = args.num_dealers * args.num_messages_per_dealer;
 
-        let mut sender_id_buf = vec![0u8; 64];
-        let mut dest_id_buf = vec![0u8; 64];
-        let mut payload_buf = vec![0u8; args.payload_size];
-
         for _ in 0..total_messages {
-            let _sender_len = router.recv_into(&mut sender_id_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            let _sender_id = router.recv_msg(0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })?;
+            let dest_id = router.recv_msg(0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })?;
+            let payload = router.recv_msg(0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
 
-            let dest_len = router.recv_into(&mut dest_id_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            router.send(dest_id, zmq::SNDMORE).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
-
-            let payload_len = router.recv_into(&mut payload_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-
-            router.send(&dest_id_buf[..dest_len], zmq::SNDMORE).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-
-            router.send(&payload_buf[..payload_len], 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            router.send(payload, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
         }

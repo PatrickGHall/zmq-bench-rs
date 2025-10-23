@@ -327,7 +327,6 @@ async fn run_dealerrouter_benchmark(
         bind_address: router_address.clone(),
         num_dealers: args.num_dealers,
         num_messages_per_dealer: args.num_messages,
-        payload_size: args.payload_size,
         hwm: args.hwm,
     };
 
