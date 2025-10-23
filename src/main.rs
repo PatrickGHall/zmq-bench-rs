@@ -1,5 +1,8 @@
 use clap::Parser;
+use std::arch::x86_64::_rdtsc;
+use std::error::Error;
 use std::time::{Duration, SystemTime};
+use tokio::runtime::Builder;
 
 mod aggregator;
 mod dealer_receiver;
@@ -16,11 +19,11 @@ fn calibrate_tsc() -> f64 {
     let mut tsc_per_ns_samples = Vec::with_capacity(CALIBRATION_SAMPLES);
 
     for _ in 0..CALIBRATION_SAMPLES {
-        let tsc_start = unsafe { std::arch::x86_64::_rdtsc() };
+        let tsc_start = unsafe { _rdtsc() };
         let time_start = SystemTime::now();
 
         std::thread::sleep(Duration::from_millis(10));
-        let tsc_end = unsafe { std::arch::x86_64::_rdtsc() };
+        let tsc_end = unsafe { _rdtsc() };
         let time_end = SystemTime::now();
 
         let elapsed_ns = time_end.duration_since(time_start).unwrap().as_nanos() as u64;
@@ -105,21 +108,36 @@ struct DealerRouterBenchmarkArgs {
     pub hwm: Option<i32>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     match args.command {
         Command::Aggregator(args) => aggregator::run(args)?,
         Command::PubsubBenchmark(args) => {
-            let rt = tokio::runtime::Runtime::new()?;
+            let total_tasks = args.num_senders * (1 + args.num_receivers_per_sender);
+            let worker_threads = total_tasks.min(num_cpus::get());
+            let rt = Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()?;
             rt.block_on(run_pubsub_benchmark(args))?;
         }
         Command::DealerBenchmark(args) => {
-            let rt = tokio::runtime::Runtime::new()?;
+            let total_tasks = args.num_pairs * 2;
+            let worker_threads = total_tasks.min(num_cpus::get());
+            let rt = Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()?;
             rt.block_on(run_dealer_benchmark(args))?;
         }
         Command::DealerRouterBenchmark(args) => {
-            let rt = tokio::runtime::Runtime::new()?;
+            let total_tasks = args.num_dealers * 2 + 1;
+            let worker_threads = total_tasks.min(num_cpus::get());
+            let rt = Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()?;
             rt.block_on(run_dealerrouter_benchmark(args))?;
         }
     }
@@ -127,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn Error>> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -217,7 +235,7 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
     Ok(())
 }
 
-async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn Error>> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -297,9 +315,7 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
     Ok(())
 }
 
-async fn run_dealerrouter_benchmark(
-    args: DealerRouterBenchmarkArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(), Box<dyn Error>> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 

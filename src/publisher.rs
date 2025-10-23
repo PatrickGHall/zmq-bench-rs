@@ -1,6 +1,9 @@
+use crate::zmq_helpers::{BoxError, JoinResultExt, ZmqResultExt};
+use std::arch::x86_64::_rdtsc;
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::sync::Barrier;
+use tokio::time::{sleep, Duration};
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -12,68 +15,34 @@ pub struct Args {
     pub batch_sleep_ms: u64,
 }
 
-pub async fn run_async(
-    args: Args,
-    barrier: Arc<Barrier>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run_async(args: Args, barrier: Arc<Barrier>) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || {
+
         let context = Context::new();
-        let publisher =
-            context
-                .socket(zmq::PUB)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
+        let publisher = context.socket(zmq::PUB).box_err()?;
 
         if let Some(hwm) = args.hwm {
-            publisher
-                .set_sndhwm(hwm)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
+            publisher.set_sndhwm(hwm).box_err()?;
         }
 
-        publisher
-            .bind(&args.address)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+        publisher.bind(&args.address).box_err()?;
 
-        let handle = tokio::runtime::Handle::current();
+        let handle = Handle::current();
         handle.block_on(barrier.wait());
 
-        //TODO: seems like subscriptions take time to register with publishers.
-        // There may be a socket event we can listen to in order to know that
-        // everyone is ready to roll, rather than this sleep.
-        std::thread::sleep(Duration::from_millis(100));
+        handle.block_on(sleep(Duration::from_millis(100)));
 
         let mut msg = vec![0u8; args.payload_size];
         let batch_size = args.hwm.unwrap_or(1000) as usize;
 
         for i in 0..args.num_messages {
-            let tsc = unsafe { std::arch::x86_64::_rdtsc() };
+            let tsc = unsafe { _rdtsc() };
             msg[0..8].copy_from_slice(&tsc.to_le_bytes());
 
-            publisher
-                .send(&msg, 0)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
+            publisher.send(&msg, 0).box_err()?;
 
             if args.batch_sleep_ms > 0 && (i + 1) % batch_size == 0 {
-                std::thread::sleep(Duration::from_millis(args.batch_sleep_ms));
+                handle.block_on(sleep(Duration::from_millis(args.batch_sleep_ms)));
             }
         }
 
@@ -85,10 +54,5 @@ pub async fn run_async(
         Ok(())
     })
     .await
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Task join error: {}", e),
-        ))
-    })?
+    .join_err()
 }

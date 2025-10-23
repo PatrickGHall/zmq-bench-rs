@@ -1,6 +1,8 @@
+use crate::zmq_helpers::{BoxError, JoinResultExt, ZmqResultExt};
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::sync::Barrier;
+use tokio::time::{sleep, Duration};
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -15,49 +17,36 @@ pub async fn run_async(
     args: Args,
     start_barrier: Arc<Barrier>,
     receiver_barrier: Arc<Barrier>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), BoxError> {
+    tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
         let context = Context::new();
-        let router = context.socket(zmq::ROUTER).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
+        let router = context.socket(zmq::ROUTER).box_err()?;
 
         if let Some(hwm) = args.hwm {
-            router.set_sndhwm(hwm).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-            router.set_rcvhwm(hwm).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
+            router.set_sndhwm(hwm).box_err()?;
+            router.set_rcvhwm(hwm).box_err()?;
         }
 
         let monitor_endpoint = "inproc://router-monitor";
-        router.monitor(monitor_endpoint, zmq::SocketEvent::ACCEPTED as i32).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
+        router
+            .monitor(monitor_endpoint, zmq::SocketEvent::ACCEPTED as i32)
+            .box_err()?;
 
-        let monitor_socket = context.socket(zmq::PAIR).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
+        let monitor_socket = context.socket(zmq::PAIR).box_err()?;
 
-        std::thread::sleep(Duration::from_millis(100));
+        let handle = Handle::current();
+        handle.block_on(sleep(Duration::from_millis(100)));
 
-        monitor_socket.connect(monitor_endpoint).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
+        monitor_socket.connect(monitor_endpoint).box_err()?;
 
-        router.bind(&args.bind_address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
+        router.bind(&args.bind_address).box_err()?;
 
         let expected_connections = args.num_dealers * 2;
         let mut connections_accepted = 0;
 
         while connections_accepted < expected_connections {
             let mut event_msg = zmq::Message::new();
-            monitor_socket.recv(&mut event_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
+            monitor_socket.recv(&mut event_msg, 0).box_err()?;
 
             let event_data = &event_msg;
             if event_data.len() >= 2 {
@@ -68,13 +57,9 @@ pub async fn run_async(
                 }
             }
 
-            if monitor_socket.get_rcvmore().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })? {
+            if monitor_socket.get_rcvmore().box_err()? {
                 let mut _endpoint_msg = zmq::Message::new();
-                monitor_socket.recv(&mut _endpoint_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                })?;
+                monitor_socket.recv(&mut _endpoint_msg, 0).box_err()?;
             }
         }
 
@@ -84,22 +69,12 @@ pub async fn run_async(
         let total_messages = args.num_dealers * args.num_messages_per_dealer;
 
         for _ in 0..total_messages {
-            let _sender_id = router.recv_msg(0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-            let dest_id = router.recv_msg(0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-            let payload = router.recv_msg(0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
+            let _sender_id = router.recv_msg(0).box_err()?;
+            let dest_id = router.recv_msg(0).box_err()?;
+            let payload = router.recv_msg(0).box_err()?;
 
-            router.send(dest_id, zmq::SNDMORE).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-            router.send(payload, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
+            router.send(dest_id, zmq::SNDMORE).box_err()?;
+            router.send(payload, 0).box_err()?;
         }
 
         let handle = tokio::runtime::Handle::current();
@@ -113,10 +88,5 @@ pub async fn run_async(
         Ok(())
     })
     .await
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Task join error: {}", e),
-        ))
-    })?
+    .join_err()
 }
