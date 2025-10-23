@@ -1,6 +1,8 @@
 use hdrhistogram::serialization::Serializer;
 use hdrhistogram::Histogram;
 use std::fs::File;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,7 @@ fn extract_timestamp(buffer: &[u8]) -> u64 {
 pub async fn run_async(
     args: Args,
     tsc_per_ns: f64,
+    barrier: Arc<Barrier>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::task::spawn_blocking(move || {
         let context = Context::new();
@@ -36,14 +39,55 @@ pub async fn run_async(
             })?;
         }
 
+        subscriber.set_subscribe(b"").map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+
+        let monitor_endpoint = format!("inproc://monitor-sub-{}", args.id);
+        subscriber.monitor(&monitor_endpoint, zmq::SocketEvent::CONNECTED as i32).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+        let monitor_socket = context.socket(zmq::PAIR).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+        monitor_socket.connect(&monitor_endpoint).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+
         for address in &args.addresses {
             subscriber.connect(address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
         }
-        subscriber.set_subscribe(b"").map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
+
+        let expected_connections = args.addresses.len();
+        let mut connections_established = 0;
+        while connections_established < expected_connections {
+            let mut event_msg = zmq::Message::new();
+            monitor_socket.recv(&mut event_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })?;
+            let event_data = &event_msg;
+
+            if event_data.len() >= 2 {
+                let event_id = u16::from_le_bytes([event_data[0], event_data[1]]);
+                let event = zmq::SocketEvent::from_raw(event_id);
+                if event == zmq::SocketEvent::CONNECTED {
+                    if monitor_socket.get_rcvmore().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    })? {
+                        let mut _endpoint_msg = zmq::Message::new();
+                        monitor_socket.recv(&mut _endpoint_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                        })?;
+                    }
+                    connections_established += 1;
+                }
+            }
+        }
+
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(barrier.wait());
 
         const RECEIVE_TIMEOUT_MS: i32 = 5000;
         subscriber.set_rcvtimeo(RECEIVE_TIMEOUT_MS).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {

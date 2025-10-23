@@ -7,6 +7,7 @@ pub struct Args {
     pub payload_size: usize,
     pub num_messages: usize,
     pub receiver_address: String,
+    pub id: usize,
 }
 
 pub async fn run_async(
@@ -19,12 +20,15 @@ pub async fn run_async(
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;
 
-        dealer.connect(&args.receiver_address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
-
         let handle = tokio::runtime::Handle::current();
         handle.block_on(barrier.wait());
+
+        let recv_addr = args.receiver_address.clone();
+        crate::zmq_helpers::connect_and_wait(&context, &dealer, &format!("dealer-sender-{}", args.id), |socket| {
+            socket.connect(&recv_addr).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })
+        })?;
 
         let mut send_buffer = vec![0u8; args.payload_size];
         let mut ack_buffer = vec![0u8; 8];

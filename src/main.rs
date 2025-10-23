@@ -8,6 +8,7 @@ mod dealerrouter_dealer;
 mod dealerrouter_router;
 mod publisher;
 mod subscriber;
+mod zmq_helpers;
 
 fn calibrate_tsc() -> f64 {
     const CALIBRATION_SAMPLES: usize = 10;
@@ -143,8 +144,10 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
     );
 
     let total_publishers = args.num_senders;
+    let total_subscribers = args.num_senders * args.num_receivers_per_sender;
+    let total_participants = total_publishers + total_subscribers;
 
-    let barrier = Arc::new(Barrier::new(total_publishers + 1));
+    let barrier = Arc::new(Barrier::new(total_participants));
 
     let mut subscriber_tasks = Vec::new();
     let mut publisher_tasks = Vec::new();
@@ -166,8 +169,9 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
                 hwm: args.hwm,
             };
 
+            let barrier_clone = barrier.clone();
             let task = tokio::spawn(async move {
-                subscriber::run_async(sub_args, tsc_per_ns).await
+                subscriber::run_async(sub_args, tsc_per_ns, barrier_clone).await
             });
             subscriber_tasks.push(task);
         }
@@ -189,13 +193,9 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
         };
 
         let barrier_clone = barrier.clone();
-        let task = tokio::spawn(async move {
-            publisher::run_async(pub_args, barrier_clone).await
-        });
+        let task = tokio::spawn(async move { publisher::run_async(pub_args, barrier_clone).await });
         publisher_tasks.push(task);
     }
-
-    barrier.wait().await;
 
     for task in subscriber_tasks {
         match task.await {
@@ -221,10 +221,7 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
-    println!(
-        "Starting dealer benchmark with {} pairs",
-        args.num_pairs
-    );
+    println!("Starting dealer benchmark with {} pairs", args.num_pairs);
 
     println!("Calibrating TSC...");
     let tsc_per_ns = calibrate_tsc();
@@ -253,9 +250,8 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
             benchmark_name: format!("Dealer-{}", args.transport.to_uppercase()),
         };
 
-        let task = tokio::spawn(async move {
-            dealer_receiver::run_async(recv_args, tsc_per_ns).await
-        });
+        let task =
+            tokio::spawn(async move { dealer_receiver::run_async(recv_args, tsc_per_ns).await });
         receiver_tasks.push(task);
     }
 
@@ -270,12 +266,12 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
             payload_size: args.payload_size,
             num_messages: args.num_messages,
             receiver_address,
+            id: pair_id,
         };
 
         let barrier_clone = barrier.clone();
-        let task = tokio::spawn(async move {
-            dealer_sender::run_async(send_args, barrier_clone).await
-        });
+        let task =
+            tokio::spawn(async move { dealer_sender::run_async(send_args, barrier_clone).await });
         sender_tasks.push(task);
     }
 
@@ -301,13 +297,11 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
     Ok(())
 }
 
-async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_dealerrouter_benchmark(
+    args: DealerRouterBenchmarkArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
-
-    if args.num_dealers < 2 {
-        return Err("Dealer-router benchmark requires at least 2 dealers".into());
-    }
 
     println!(
         "Starting dealer-router benchmark with {} dealers",
@@ -320,7 +314,7 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         tsc_per_ns, tsc_per_ns
     );
 
-    let start_barrier = Arc::new(Barrier::new(args.num_dealers * 2));
+    let start_barrier = Arc::new(Barrier::new(args.num_dealers + 1));
     let end_barrier = Arc::new(Barrier::new(args.num_dealers + 1));
 
     let router_address = if args.transport == "ipc" {
@@ -337,6 +331,12 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         hwm: args.hwm,
     };
 
+    let start_barrier_clone = start_barrier.clone();
+    let end_barrier_clone = end_barrier.clone();
+    let router_task = tokio::spawn(async move {
+        dealerrouter_router::run_async(router_args, start_barrier_clone, end_barrier_clone).await
+    });
+
     let mut dealer_tasks = Vec::new();
     for dealer_id in 0..args.num_dealers {
         let dealer_args = dealerrouter_dealer::Args {
@@ -352,15 +352,16 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         let start_barrier_clone = start_barrier.clone();
         let end_barrier_clone = end_barrier.clone();
         let task = tokio::spawn(async move {
-            dealerrouter_dealer::run_async(dealer_args, start_barrier_clone, end_barrier_clone, tsc_per_ns).await
+            dealerrouter_dealer::run_async(
+                dealer_args,
+                start_barrier_clone,
+                end_barrier_clone,
+                tsc_per_ns,
+            )
+            .await
         });
         dealer_tasks.push(task);
     }
-
-    let end_barrier_clone = end_barrier.clone();
-    let router_task = tokio::spawn(async move {
-        dealerrouter_router::run_async(router_args, end_barrier_clone).await
-    });
 
     for task in dealer_tasks {
         match task.await {
@@ -370,13 +371,11 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         }
     }
 
-    println!("Waiting on the router");
     match router_task.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("Router task failed: {}", e).into()),
         Err(e) => return Err(format!("Router task join error: {}", e).into()),
     }
-    println!("Router finished up");
 
     println!("Dealer-router benchmark complete!");
     Ok(())

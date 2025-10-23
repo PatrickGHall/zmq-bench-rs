@@ -31,7 +31,6 @@ pub async fn run_async(
     let target_receiver_id = ((args.dealer_id + 1) % args.num_dealers) * 2 + 1;
 
     let recv_args = args.clone();
-    let recv_start_barrier = start_barrier.clone();
     let recv_end_barrier = end_barrier.clone();
     let recv_handle = tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let context = Context::new();
@@ -50,50 +49,12 @@ pub async fn run_async(
             })?;
         }
 
-        let monitor_endpoint = format!("inproc://monitor-dealer-r-{}", receiver_id);
-        receiver.monitor(&monitor_endpoint, zmq::SocketEvent::CONNECTED as i32).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
-        let monitor_socket = context.socket(zmq::PAIR).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
-        monitor_socket.connect(&monitor_endpoint).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
-
         receiver.connect(&recv_args.router_address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;
 
-        loop {
-            let mut event_msg = zmq::Message::new();
-            monitor_socket.recv(&mut event_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-            let event_data = &event_msg;
-
-            if event_data.len() >= 2 {
-                let event_id = u16::from_le_bytes([event_data[0], event_data[1]]);
-                let event = zmq::SocketEvent::from_raw(event_id);
-                if event == zmq::SocketEvent::CONNECTED {
-                    if monitor_socket.get_rcvmore().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                    })? {
-                        let mut _endpoint_msg = zmq::Message::new();
-                        monitor_socket.recv(&mut _endpoint_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                        })?;
-                    }
-                    break; // Connected
-                }
-            }
-        }
-
         let mut recv_buffer = vec![0u8; recv_args.payload_size];
         let mut latencies = Vec::with_capacity(recv_args.num_messages);
-
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(recv_start_barrier.wait());
 
         for _ in 0..recv_args.num_messages {
             receiver.recv_into(&mut recv_buffer, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -105,6 +66,8 @@ pub async fn run_async(
 
             latencies.push(recv_tsc - sent_tsc);
         }
+
+        let handle = tokio::runtime::Handle::current();
         handle.block_on(recv_end_barrier.wait());
 
         use hdrhistogram::Histogram;
@@ -158,15 +121,18 @@ pub async fn run_async(
             })?;
         }
 
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(send_barrier.wait());
-
-        sender.connect(&send_args.router_address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        let router_addr = send_args.router_address.clone();
+        crate::zmq_helpers::connect_and_wait(&context, &sender, &format!("dealer-s-{}", sender_id), |socket| {
+            socket.connect(&router_addr).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })
         })?;
 
         let dest_id = format!("dealer_{}", target_receiver_id).into_bytes();
         let mut send_buffer = vec![0u8; send_args.payload_size];
+
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(send_barrier.wait());
 
         for _ in 0..send_args.num_messages {
             let send_tsc = unsafe { std::arch::x86_64::_rdtsc() };

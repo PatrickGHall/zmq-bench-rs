@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Barrier;
 use zmq::Context;
 
@@ -13,6 +14,7 @@ pub struct Args {
 
 pub async fn run_async(
     args: Args,
+    start_barrier: Arc<Barrier>,
     receiver_barrier: Arc<Barrier>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -30,33 +32,80 @@ pub async fn run_async(
             })?;
         }
 
+        let monitor_endpoint = "inproc://router-monitor";
+        router.monitor(monitor_endpoint, zmq::SocketEvent::ACCEPTED as i32).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+
+        let monitor_socket = context.socket(zmq::PAIR).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        monitor_socket.connect(monitor_endpoint).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+
         router.bind(&args.bind_address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;
 
+        let expected_connections = args.num_dealers * 2;
+        let mut connections_accepted = 0;
+
+        while connections_accepted < expected_connections {
+            let mut event_msg = zmq::Message::new();
+            monitor_socket.recv(&mut event_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })?;
+
+            let event_data = &event_msg;
+            if event_data.len() >= 2 {
+                let event_id = u16::from_le_bytes([event_data[0], event_data[1]]);
+                let event = zmq::SocketEvent::from_raw(event_id);
+                if event == zmq::SocketEvent::ACCEPTED {
+                    connections_accepted += 1;
+                }
+            }
+
+            if monitor_socket.get_rcvmore().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })? {
+                let mut _endpoint_msg = zmq::Message::new();
+                monitor_socket.recv(&mut _endpoint_msg, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })?;
+            }
+        }
+
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(start_barrier.wait());
+
         let total_messages = args.num_dealers * args.num_messages_per_dealer;
-        let mut sender_id = zmq::Message::new();
-        let mut dest_id = zmq::Message::new();
+
+        let mut sender_id_buf = vec![0u8; 64];
+        let mut dest_id_buf = vec![0u8; 64];
         let mut payload_buf = vec![0u8; args.payload_size];
 
         for _ in 0..total_messages {
-            router.recv(&mut sender_id, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            let _sender_len = router.recv_into(&mut sender_id_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
 
-            router.recv(&mut dest_id, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            let dest_len = router.recv_into(&mut dest_id_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
 
-            router.recv_into(&mut payload_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            let payload_len = router.recv_into(&mut payload_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
 
-            router.send(&*dest_id, zmq::SNDMORE).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            router.send(&dest_id_buf[..dest_len], zmq::SNDMORE).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
 
-            router.send(&payload_buf, 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            router.send(&payload_buf[..payload_len], 0).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
         }
