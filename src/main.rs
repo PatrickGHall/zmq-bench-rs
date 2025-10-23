@@ -4,16 +4,13 @@ use std::time::{Duration, SystemTime};
 mod aggregator;
 mod dealer_receiver;
 mod dealer_sender;
+mod dealerrouter_dealer;
+mod dealerrouter_router;
 mod publisher;
 mod subscriber;
 
-/// Calibrate the TSC (Time Stamp Counter) to convert cycles to nanoseconds.
-///
-/// This function performs multiple calibration samples and returns the median
-/// TSC frequency (cycles per nanosecond)
 fn calibrate_tsc() -> f64 {
     const CALIBRATION_SAMPLES: usize = 10;
-    const CALIBRATION_SLEEP_MS: u64 = 100;
 
     let mut tsc_per_ns_samples = Vec::with_capacity(CALIBRATION_SAMPLES);
 
@@ -21,8 +18,7 @@ fn calibrate_tsc() -> f64 {
         let tsc_start = unsafe { std::arch::x86_64::_rdtsc() };
         let time_start = SystemTime::now();
 
-        std::thread::sleep(Duration::from_millis(CALIBRATION_SLEEP_MS));
-
+        std::thread::sleep(Duration::from_millis(10));
         let tsc_end = unsafe { std::arch::x86_64::_rdtsc() };
         let time_end = SystemTime::now();
 
@@ -48,6 +44,7 @@ enum Command {
     Aggregator(aggregator::Args),
     PubsubBenchmark(PubsubBenchmarkArgs),
     DealerBenchmark(DealerBenchmarkArgs),
+    DealerRouterBenchmark(DealerRouterBenchmarkArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -89,6 +86,24 @@ struct DealerBenchmarkArgs {
     pub transport: String,
 }
 
+#[derive(Parser, Debug)]
+struct DealerRouterBenchmarkArgs {
+    #[clap(long, default_value = "2")]
+    pub num_dealers: usize,
+
+    #[clap(long, default_value = "10000")]
+    pub num_messages: usize,
+
+    #[clap(long, default_value = "64")]
+    pub payload_size: usize,
+
+    #[clap(long, default_value = "ipc")]
+    pub transport: String,
+
+    #[clap(long)]
+    pub hwm: Option<i32>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -102,19 +117,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_dealer_benchmark(args))?;
         }
+        Command::DealerRouterBenchmark(args) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_dealerrouter_benchmark(args))?;
+        }
     }
 
     Ok(())
 }
 
-/// Run a ZMQ pub/sub latency benchmark with multiple senders and receivers.
-///
-/// This function orchestrates a complete benchmark run by:
-/// 1. Calibrating the TSC (Time Stamp Counter) once for all tasks
-/// 2. Spawning publisher and subscriber tasks in Tokio green threads
-/// 3. Using a barrier to synchronize the start of all tasks
-/// 4. Waiting for all tasks to complete
-///
 async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
@@ -131,10 +142,9 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
         tsc_per_ns, tsc_per_ns
     );
 
-    let total_subscribers = args.num_senders * args.num_receivers_per_sender;
     let total_publishers = args.num_senders;
 
-    let barrier = Arc::new(Barrier::new(total_subscribers + total_publishers + 1));
+    let barrier = Arc::new(Barrier::new(total_publishers + 1));
 
     let mut subscriber_tasks = Vec::new();
     let mut publisher_tasks = Vec::new();
@@ -156,9 +166,8 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
                 hwm: args.hwm,
             };
 
-            let barrier_clone = barrier.clone();
             let task = tokio::spawn(async move {
-                subscriber::run_async(sub_args, barrier_clone, tsc_per_ns).await
+                subscriber::run_async(sub_args, tsc_per_ns).await
             });
             subscriber_tasks.push(task);
         }
@@ -208,14 +217,6 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// Run a ZMQ dealer-dealer latency benchmark with request-reply pattern.
-///
-/// This function orchestrates a dealer benchmark with:
-/// 1. Calibrating the TSC once for all tasks
-/// 2. Spawning N receiver tasks (bind to sockets)
-/// 3. Spawning N sender tasks (connect to receivers)
-/// 4. Using a barrier to synchronize the start
-/// 5. Senders perform request-reply: send message, wait for ACK
 async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
@@ -232,7 +233,7 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
         tsc_per_ns, tsc_per_ns
     );
 
-    let barrier = Arc::new(Barrier::new(args.num_pairs * 2 + 1));
+    let barrier = Arc::new(Barrier::new(args.num_pairs + 1));
 
     let mut receiver_tasks = Vec::new();
     let mut sender_tasks = Vec::new();
@@ -252,9 +253,8 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
             benchmark_name: format!("Dealer-{}", args.transport.to_uppercase()),
         };
 
-        let barrier_clone = barrier.clone();
         let task = tokio::spawn(async move {
-            dealer_receiver::run_async(recv_args, barrier_clone, tsc_per_ns).await
+            dealer_receiver::run_async(recv_args, tsc_per_ns).await
         });
         receiver_tasks.push(task);
     }
@@ -298,5 +298,86 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn s
     }
 
     println!("Dealer benchmark complete!");
+    Ok(())
+}
+
+async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    if args.num_dealers < 2 {
+        return Err("Dealer-router benchmark requires at least 2 dealers".into());
+    }
+
+    println!(
+        "Starting dealer-router benchmark with {} dealers",
+        args.num_dealers
+    );
+
+    let tsc_per_ns = calibrate_tsc();
+    println!(
+        "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
+        tsc_per_ns, tsc_per_ns
+    );
+
+    let start_barrier = Arc::new(Barrier::new(args.num_dealers * 2));
+    let end_barrier = Arc::new(Barrier::new(args.num_dealers + 1));
+
+    let router_address = if args.transport == "ipc" {
+        "ipc:///tmp/dealerrouter.ipc".to_string()
+    } else {
+        "tcp://127.0.0.1:7000".to_string()
+    };
+
+    let router_args = dealerrouter_router::Args {
+        bind_address: router_address.clone(),
+        num_dealers: args.num_dealers,
+        num_messages_per_dealer: args.num_messages,
+        payload_size: args.payload_size,
+        hwm: args.hwm,
+    };
+
+    let mut dealer_tasks = Vec::new();
+    for dealer_id in 0..args.num_dealers {
+        let dealer_args = dealerrouter_dealer::Args {
+            payload_size: args.payload_size,
+            num_messages: args.num_messages,
+            router_address: router_address.clone(),
+            dealer_id,
+            num_dealers: args.num_dealers,
+            benchmark_name: format!("DealerRouter-{}", args.transport.to_uppercase()),
+            hwm: args.hwm,
+        };
+
+        let start_barrier_clone = start_barrier.clone();
+        let end_barrier_clone = end_barrier.clone();
+        let task = tokio::spawn(async move {
+            dealerrouter_dealer::run_async(dealer_args, start_barrier_clone, end_barrier_clone, tsc_per_ns).await
+        });
+        dealer_tasks.push(task);
+    }
+
+    let end_barrier_clone = end_barrier.clone();
+    let router_task = tokio::spawn(async move {
+        dealerrouter_router::run_async(router_args, end_barrier_clone).await
+    });
+
+    for task in dealer_tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Dealer task failed: {}", e).into()),
+            Err(e) => return Err(format!("Dealer task join error: {}", e).into()),
+        }
+    }
+
+    println!("Waiting on the router");
+    match router_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("Router task failed: {}", e).into()),
+        Err(e) => return Err(format!("Router task join error: {}", e).into()),
+    }
+    println!("Router finished up");
+
+    println!("Dealer-router benchmark complete!");
     Ok(())
 }

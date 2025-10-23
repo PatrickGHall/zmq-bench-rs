@@ -1,8 +1,6 @@
 use hdrhistogram::serialization::Serializer;
 use hdrhistogram::Histogram;
 use std::fs::File;
-use std::sync::Arc;
-use tokio::sync::Barrier;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -24,7 +22,6 @@ fn extract_timestamp(buffer: &[u8]) -> u64 {
 
 pub async fn run_async(
     args: Args,
-    barrier: Arc<Barrier>,
     tsc_per_ns: f64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::task::spawn_blocking(move || {
@@ -52,9 +49,6 @@ pub async fn run_async(
         subscriber.set_rcvtimeo(RECEIVE_TIMEOUT_MS).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;
-
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(barrier.wait());
 
         let mut recv_buffer = vec![0u8; args.payload_size];
         let mut latencies = Vec::with_capacity(args.num_messages);

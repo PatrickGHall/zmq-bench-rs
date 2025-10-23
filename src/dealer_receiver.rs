@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use tokio::sync::Barrier;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -20,7 +18,6 @@ fn extract_timestamp(buffer: &[u8]) -> u64 {
 
 pub async fn run_async(
     args: Args,
-    barrier: Arc<Barrier>,
     tsc_per_ns: f64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::task::spawn_blocking(move || {
@@ -32,9 +29,6 @@ pub async fn run_async(
         dealer.bind(&args.bind_address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;
-
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(barrier.wait());
 
         let mut recv_buffer = vec![0u8; args.payload_size];
         let ack = vec![0u8; 8];
