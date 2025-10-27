@@ -9,6 +9,7 @@ HWM=100000
 BATCH_SLEEP_MS=0
 NUM_DEALER_PAIRS=1
 NUM_DEALERROUTER_DEALERS=1
+NUM_PROXY_PAIRS=1
 
 PAYLOAD_SIZES=(8 64 256 1024 4096 16384 65536 262144 1048576 2097152)
 
@@ -23,6 +24,7 @@ echo "Starting benchmarks..."
 echo "PUB/SUB Configuration: $NUM_SENDERS senders, $NUM_RECEIVERS_PER_SENDER receivers per sender, $NUM_MESSAGES messages"
 echo "DEALER Configuration: $NUM_DEALER_PAIRS pairs, $NUM_MESSAGES messages"
 echo "DEALER-ROUTER Configuration: $NUM_DEALERROUTER_DEALERS dealers (circular), $NUM_MESSAGES messages (per dealer), High Water Mark: $HWM"
+echo "PROXY Configuration: $NUM_PROXY_PAIRS pairs, $NUM_MESSAGES messages, High Water Mark: $HWM"
 echo "Batch sleep: ${BATCH_SLEEP_MS}ms (PUB/SUB only)"
 echo ""
 
@@ -93,6 +95,28 @@ run_dealerrouter_benchmark() {
     echo ""
 }
 
+run_proxy_benchmark() {
+    local transport=$1
+    local size=$2
+
+    echo "Running PROXY ${transport^^} - Payload: $size bytes"
+
+    $TARGET_DIR/zmq-bench proxy-benchmark \
+        --num-pairs $NUM_PROXY_PAIRS \
+        --num-messages $NUM_MESSAGES \
+        --payload-size $size \
+        --transport $transport \
+        --hwm $HWM
+
+    $TARGET_DIR/zmq-bench aggregator \
+        --pattern "Proxy" \
+        --transport "${transport^^}" \
+        --payload-size $size
+
+    echo "  Completed PROXY ${transport^^} - Payload: $size bytes"
+    echo ""
+}
+
 echo "=== PUB/SUB Benchmarks ==="
 for size in "${PAYLOAD_SIZES[@]}"; do
     run_pubsub_benchmark "ipc" $size
@@ -121,6 +145,16 @@ done
 
 for size in "${PAYLOAD_SIZES[@]}"; do
     run_dealerrouter_benchmark "tcp" $size
+done
+
+echo "=== PROXY Benchmarks ==="
+for size in "${PAYLOAD_SIZES[@]}"; do
+    run_proxy_benchmark "ipc" $size
+    rm -f /tmp/proxy_*.ipc
+done
+
+for size in "${PAYLOAD_SIZES[@]}"; do
+    run_proxy_benchmark "tcp" $size
 done
 
 echo "All benchmarks complete! Results in results.csv"

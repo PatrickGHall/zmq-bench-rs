@@ -9,6 +9,8 @@ mod dealer_receiver;
 mod dealer_sender;
 mod dealerrouter_dealer;
 mod dealerrouter_router;
+mod proxy_dealer;
+mod proxy_router;
 mod publisher;
 mod subscriber;
 mod zmq_helpers;
@@ -49,6 +51,7 @@ enum Command {
     PubsubBenchmark(PubsubBenchmarkArgs),
     DealerBenchmark(DealerBenchmarkArgs),
     DealerRouterBenchmark(DealerRouterBenchmarkArgs),
+    ProxyBenchmark(ProxyBenchmarkArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -108,6 +111,24 @@ struct DealerRouterBenchmarkArgs {
     pub hwm: Option<i32>,
 }
 
+#[derive(Parser, Debug)]
+struct ProxyBenchmarkArgs {
+    #[clap(long, default_value = "1")]
+    pub num_pairs: usize,
+
+    #[clap(long, default_value = "10000")]
+    pub num_messages: usize,
+
+    #[clap(long, default_value = "64")]
+    pub payload_size: usize,
+
+    #[clap(long, default_value = "ipc")]
+    pub transport: String,
+
+    #[clap(long)]
+    pub hwm: Option<i32>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
@@ -139,6 +160,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(run_dealerrouter_benchmark(args))?;
+        }
+        Command::ProxyBenchmark(args) => {
+            let total_tasks = args.num_pairs * 2;
+            let worker_threads = total_tasks.min(num_cpus::get());
+            let rt = Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()?;
+            rt.block_on(run_proxy_benchmark(args))?;
         }
     }
 
@@ -393,5 +423,97 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
     }
 
     println!("Dealer-router benchmark complete!");
+    Ok(())
+}
+
+async fn run_proxy_benchmark(args: ProxyBenchmarkArgs) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    println!(
+        "Starting proxy benchmark with {} pairs",
+        args.num_pairs
+    );
+
+    let tsc_per_ns = calibrate_tsc();
+    println!(
+        "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
+        tsc_per_ns, tsc_per_ns
+    );
+
+    let start_barrier = Arc::new(Barrier::new(args.num_pairs * 2));
+    let end_barrier = Arc::new(Barrier::new(args.num_pairs * 2));
+
+    let mut proxy_tasks = Vec::new();
+    let mut dealer_tasks = Vec::new();
+
+    for pair_id in 0..args.num_pairs {
+        let frontend_address = if args.transport == "ipc" {
+            format!("ipc:///tmp/proxy_frontend_{}.ipc", pair_id)
+        } else {
+            format!("tcp://127.0.0.1:{}", 8000 + pair_id * 2)
+        };
+
+        let backend_address = if args.transport == "ipc" {
+            format!("ipc:///tmp/proxy_backend_{}.ipc", pair_id)
+        } else {
+            format!("tcp://127.0.0.1:{}", 8000 + pair_id * 2 + 1)
+        };
+
+        let proxy_args = proxy_router::Args {
+            frontend_address: frontend_address.clone(),
+            backend_address: backend_address.clone(),
+            num_messages: args.num_messages,
+            hwm: args.hwm,
+        };
+
+        let start_barrier_clone = start_barrier.clone();
+        let end_barrier_clone = end_barrier.clone();
+        let task = tokio::spawn(async move {
+            proxy_router::run_async(proxy_args, start_barrier_clone, end_barrier_clone).await
+        });
+        proxy_tasks.push(task);
+
+        let dealer_args = proxy_dealer::Args {
+            frontend_address,
+            backend_address,
+            payload_size: args.payload_size,
+            num_messages: args.num_messages,
+            pair_id,
+            benchmark_name: format!("Proxy-{}", args.transport.to_uppercase()),
+            hwm: args.hwm,
+        };
+
+        let start_barrier_clone = start_barrier.clone();
+        let end_barrier_clone = end_barrier.clone();
+        let task = tokio::spawn(async move {
+            proxy_dealer::run_async(
+                dealer_args,
+                start_barrier_clone,
+                end_barrier_clone,
+                tsc_per_ns,
+            )
+            .await
+        });
+        dealer_tasks.push(task);
+    }
+
+    for task in dealer_tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Dealer task failed: {}", e).into()),
+            Err(e) => return Err(format!("Dealer task join error: {}", e).into()),
+        }
+    }
+
+    for task in proxy_tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Proxy task failed: {}", e).into()),
+            Err(e) => return Err(format!("Proxy task join error: {}", e).into()),
+        }
+    }
+
+    println!("Proxy benchmark complete!");
     Ok(())
 }
