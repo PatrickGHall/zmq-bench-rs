@@ -1,16 +1,15 @@
 use clap::Parser;
 use std::arch::x86_64::_rdtsc;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
-
+use tokio::sync::Barrier;
 mod aggregator;
 mod dealer_receiver;
 mod dealer_sender;
 mod dealerrouter_dealer;
 mod dealerrouter_router;
-mod proxy_dealer;
-mod proxy_router;
 mod publisher;
 mod subscriber;
 mod zmq_helpers;
@@ -51,7 +50,6 @@ enum Command {
     PubsubBenchmark(PubsubBenchmarkArgs),
     DealerBenchmark(DealerBenchmarkArgs),
     DealerRouterBenchmark(DealerRouterBenchmarkArgs),
-    ProxyBenchmark(ProxyBenchmarkArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -62,7 +60,7 @@ struct PubsubBenchmarkArgs {
     #[clap(long, default_value = "1")]
     pub num_receivers_per_sender: usize,
 
-    #[clap(long, default_value = "100000")]
+    #[clap(long, default_value = "10000")]
     pub num_messages: usize,
 
     #[clap(long, default_value = "64")]
@@ -71,8 +69,8 @@ struct PubsubBenchmarkArgs {
     #[clap(long, default_value = "ipc")]
     pub transport: String,
 
-    #[clap(long)]
-    pub hwm: Option<i32>,
+    #[clap(long, default_value = "1000")]
+    pub hwm: i32,
 
     #[clap(long, default_value = "10")]
     pub batch_sleep_ms: u64,
@@ -95,7 +93,7 @@ struct DealerBenchmarkArgs {
 
 #[derive(Parser, Debug)]
 struct DealerRouterBenchmarkArgs {
-    #[clap(long, default_value = "2")]
+    #[clap(long, default_value = "1")]
     pub num_dealers: usize,
 
     #[clap(long, default_value = "10000")]
@@ -107,26 +105,11 @@ struct DealerRouterBenchmarkArgs {
     #[clap(long, default_value = "ipc")]
     pub transport: String,
 
-    #[clap(long)]
-    pub hwm: Option<i32>,
-}
+    #[clap(long, default_value = "1000")]
+    pub hwm: i32,
 
-#[derive(Parser, Debug)]
-struct ProxyBenchmarkArgs {
-    #[clap(long, default_value = "1")]
-    pub num_pairs: usize,
-
-    #[clap(long, default_value = "10000")]
-    pub num_messages: usize,
-
-    #[clap(long, default_value = "64")]
-    pub payload_size: usize,
-
-    #[clap(long, default_value = "ipc")]
-    pub transport: String,
-
-    #[clap(long)]
-    pub hwm: Option<i32>,
+    #[clap(long, default_value = "10")]
+    pub batch_sleep_ms: u64,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -161,24 +144,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .build()?;
             rt.block_on(run_dealerrouter_benchmark(args))?;
         }
-        Command::ProxyBenchmark(args) => {
-            let total_tasks = args.num_pairs * 2;
-            let worker_threads = total_tasks.min(num_cpus::get());
-            let rt = Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .build()?;
-            rt.block_on(run_proxy_benchmark(args))?;
-        }
     }
 
     Ok(())
 }
 
 async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn Error>> {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
-
     println!(
         "Starting benchmark with {} senders and {} receivers per sender",
         args.num_senders, args.num_receivers_per_sender
@@ -190,12 +161,6 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
         "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
         tsc_per_ns, tsc_per_ns
     );
-
-    let total_publishers = args.num_senders;
-    let total_subscribers = args.num_senders * args.num_receivers_per_sender;
-    let total_participants = total_publishers + total_subscribers;
-
-    let barrier = Arc::new(Barrier::new(total_participants));
 
     let mut subscriber_tasks = Vec::new();
     let mut publisher_tasks = Vec::new();
@@ -217,10 +182,8 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
                 hwm: args.hwm,
             };
 
-            let barrier_clone = barrier.clone();
-            let task = tokio::spawn(async move {
-                subscriber::run_async(sub_args, tsc_per_ns, barrier_clone).await
-            });
+            let task =
+                tokio::spawn(async move { subscriber::run_async(sub_args, tsc_per_ns).await });
             subscriber_tasks.push(task);
         }
     }
@@ -240,8 +203,7 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             batch_sleep_ms: args.batch_sleep_ms,
         };
 
-        let barrier_clone = barrier.clone();
-        let task = tokio::spawn(async move { publisher::run_async(pub_args, barrier_clone).await });
+        let task = tokio::spawn(async move { publisher::run_async(pub_args).await });
         publisher_tasks.push(task);
     }
 
@@ -266,9 +228,6 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
 }
 
 async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn Error>> {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
-
     println!("Starting dealer benchmark with {} pairs", args.num_pairs);
 
     println!("Calibrating TSC...");
@@ -277,8 +236,6 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
         "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
         tsc_per_ns, tsc_per_ns
     );
-
-    let barrier = Arc::new(Barrier::new(args.num_pairs + 1));
 
     let mut receiver_tasks = Vec::new();
     let mut sender_tasks = Vec::new();
@@ -314,16 +271,11 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
             payload_size: args.payload_size,
             num_messages: args.num_messages,
             receiver_address,
-            id: pair_id,
         };
 
-        let barrier_clone = barrier.clone();
-        let task =
-            tokio::spawn(async move { dealer_sender::run_async(send_args, barrier_clone).await });
+        let task = tokio::spawn(async move { dealer_sender::run_async(send_args).await });
         sender_tasks.push(task);
     }
-
-    barrier.wait().await;
 
     for task in receiver_tasks {
         match task.await {
@@ -346,9 +298,6 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
 }
 
 async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(), Box<dyn Error>> {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
-
     println!(
         "Starting dealer-router benchmark with {} dealers",
         args.num_dealers
@@ -360,7 +309,6 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         tsc_per_ns, tsc_per_ns
     );
 
-    let start_barrier = Arc::new(Barrier::new(args.num_dealers + 1));
     let end_barrier = Arc::new(Barrier::new(args.num_dealers + 1));
 
     let router_address = if args.transport == "ipc" {
@@ -376,10 +324,9 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         hwm: args.hwm,
     };
 
-    let start_barrier_clone = start_barrier.clone();
     let end_barrier_clone = end_barrier.clone();
     let router_task = tokio::spawn(async move {
-        dealerrouter_router::run_async(router_args, start_barrier_clone, end_barrier_clone).await
+        dealerrouter_router::run_async(router_args, end_barrier_clone).await
     });
 
     let mut dealer_tasks = Vec::new();
@@ -387,23 +334,17 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         let dealer_args = dealerrouter_dealer::Args {
             payload_size: args.payload_size,
             num_messages: args.num_messages,
+            hwm: args.hwm,
+            batch_sleep_ms: args.batch_sleep_ms,
             router_address: router_address.clone(),
             dealer_id,
             num_dealers: args.num_dealers,
             benchmark_name: format!("DealerRouter-{}", args.transport.to_uppercase()),
-            hwm: args.hwm,
         };
 
-        let start_barrier_clone = start_barrier.clone();
         let end_barrier_clone = end_barrier.clone();
         let task = tokio::spawn(async move {
-            dealerrouter_dealer::run_async(
-                dealer_args,
-                start_barrier_clone,
-                end_barrier_clone,
-                tsc_per_ns,
-            )
-            .await
+            dealerrouter_dealer::run_async(dealer_args, end_barrier_clone, tsc_per_ns).await
         });
         dealer_tasks.push(task);
     }
@@ -423,97 +364,5 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
     }
 
     println!("Dealer-router benchmark complete!");
-    Ok(())
-}
-
-async fn run_proxy_benchmark(args: ProxyBenchmarkArgs) -> Result<(), Box<dyn Error>> {
-    use std::sync::Arc;
-    use tokio::sync::Barrier;
-
-    println!(
-        "Starting proxy benchmark with {} pairs",
-        args.num_pairs
-    );
-
-    let tsc_per_ns = calibrate_tsc();
-    println!(
-        "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
-        tsc_per_ns, tsc_per_ns
-    );
-
-    let start_barrier = Arc::new(Barrier::new(args.num_pairs * 2));
-    let end_barrier = Arc::new(Barrier::new(args.num_pairs * 2));
-
-    let mut proxy_tasks = Vec::new();
-    let mut dealer_tasks = Vec::new();
-
-    for pair_id in 0..args.num_pairs {
-        let frontend_address = if args.transport == "ipc" {
-            format!("ipc:///tmp/proxy_frontend_{}.ipc", pair_id)
-        } else {
-            format!("tcp://127.0.0.1:{}", 8000 + pair_id * 2)
-        };
-
-        let backend_address = if args.transport == "ipc" {
-            format!("ipc:///tmp/proxy_backend_{}.ipc", pair_id)
-        } else {
-            format!("tcp://127.0.0.1:{}", 8000 + pair_id * 2 + 1)
-        };
-
-        let proxy_args = proxy_router::Args {
-            frontend_address: frontend_address.clone(),
-            backend_address: backend_address.clone(),
-            num_messages: args.num_messages,
-            hwm: args.hwm,
-        };
-
-        let start_barrier_clone = start_barrier.clone();
-        let end_barrier_clone = end_barrier.clone();
-        let task = tokio::spawn(async move {
-            proxy_router::run_async(proxy_args, start_barrier_clone, end_barrier_clone).await
-        });
-        proxy_tasks.push(task);
-
-        let dealer_args = proxy_dealer::Args {
-            frontend_address,
-            backend_address,
-            payload_size: args.payload_size,
-            num_messages: args.num_messages,
-            pair_id,
-            benchmark_name: format!("Proxy-{}", args.transport.to_uppercase()),
-            hwm: args.hwm,
-        };
-
-        let start_barrier_clone = start_barrier.clone();
-        let end_barrier_clone = end_barrier.clone();
-        let task = tokio::spawn(async move {
-            proxy_dealer::run_async(
-                dealer_args,
-                start_barrier_clone,
-                end_barrier_clone,
-                tsc_per_ns,
-            )
-            .await
-        });
-        dealer_tasks.push(task);
-    }
-
-    for task in dealer_tasks {
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Dealer task failed: {}", e).into()),
-            Err(e) => return Err(format!("Dealer task join error: {}", e).into()),
-        }
-    }
-
-    for task in proxy_tasks {
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Proxy task failed: {}", e).into()),
-            Err(e) => return Err(format!("Proxy task join error: {}", e).into()),
-        }
-    }
-
-    println!("Proxy benchmark complete!");
     Ok(())
 }

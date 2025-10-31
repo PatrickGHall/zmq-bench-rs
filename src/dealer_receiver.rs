@@ -16,14 +16,12 @@ pub struct Args {
 
 fn extract_timestamp(buffer: &[u8]) -> u64 {
     u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3],
-        buffer[4], buffer[5], buffer[6], buffer[7],
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ])
 }
 
 pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || {
-
         let context = Context::new();
         let dealer = context.socket(zmq::DEALER).box_err()?;
 

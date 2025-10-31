@@ -3,9 +3,6 @@ use hdrhistogram::serialization::Serializer;
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
 use std::fs::File;
-use std::sync::Arc;
-use tokio::runtime::Handle;
-use tokio::sync::Barrier;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -15,61 +12,26 @@ pub struct Args {
     pub id: String,
     pub benchmark_name: String,
     pub payload_size: usize,
-    pub hwm: Option<i32>,
+    pub hwm: i32,
 }
 
 fn extract_timestamp(buffer: &[u8]) -> u64 {
     u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3],
-        buffer[4], buffer[5], buffer[6], buffer[7],
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ])
 }
 
-pub async fn run_async(args: Args, tsc_per_ns: f64, barrier: Arc<Barrier>) -> Result<(), BoxError> {
+pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || {
-
         let context = Context::new();
         let subscriber = context.socket(zmq::SUB).box_err()?;
-
-        if let Some(hwm) = args.hwm {
-            subscriber.set_rcvhwm(hwm).box_err()?;
-        }
+        subscriber.set_rcvhwm(args.hwm).box_err()?;
 
         subscriber.set_subscribe(b"").box_err()?;
-
-        let monitor_endpoint = format!("inproc://monitor-sub-{}", args.id);
-        subscriber
-            .monitor(&monitor_endpoint, zmq::SocketEvent::CONNECTED as i32)
-            .box_err()?;
-        let monitor_socket = context.socket(zmq::PAIR).box_err()?;
-        monitor_socket.connect(&monitor_endpoint).box_err()?;
 
         for address in &args.addresses {
             subscriber.connect(address).box_err()?;
         }
-
-        let expected_connections = args.addresses.len();
-        let mut connections_established = 0;
-        while connections_established < expected_connections {
-            let mut event_msg = zmq::Message::new();
-            monitor_socket.recv(&mut event_msg, 0).box_err()?;
-            let event_data = &event_msg;
-
-            if event_data.len() >= 2 {
-                let event_id = u16::from_le_bytes([event_data[0], event_data[1]]);
-                let event = zmq::SocketEvent::from_raw(event_id);
-                if event == zmq::SocketEvent::CONNECTED {
-                    if monitor_socket.get_rcvmore().box_err()? {
-                        let mut _endpoint_msg = zmq::Message::new();
-                        monitor_socket.recv(&mut _endpoint_msg, 0).box_err()?;
-                    }
-                    connections_established += 1;
-                }
-            }
-        }
-
-        let handle = Handle::current();
-        handle.block_on(barrier.wait());
 
         const RECEIVE_TIMEOUT_MS: i32 = 5000;
         subscriber.set_rcvtimeo(RECEIVE_TIMEOUT_MS).box_err()?;
