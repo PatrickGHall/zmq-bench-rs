@@ -1,4 +1,5 @@
 use clap::Parser;
+use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
 use std::error::Error;
 use std::sync::Arc;
@@ -46,10 +47,10 @@ struct Args {
 
 #[derive(Parser, Debug)]
 enum Command {
-    Aggregator(aggregator::Args),
     PubsubBenchmark(PubsubBenchmarkArgs),
     DealerBenchmark(DealerBenchmarkArgs),
     DealerRouterBenchmark(DealerRouterBenchmarkArgs),
+    RunBenchmarks(RunBenchmarksArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -112,11 +113,38 @@ struct DealerRouterBenchmarkArgs {
     pub batch_sleep_ms: u64,
 }
 
+/// Full suite runner. Args and defaults match the original run_benchmarks.sh script.
+#[derive(Parser, Debug)]
+struct RunBenchmarksArgs {
+    #[clap(long, default_value = "1")]
+    pub num_senders: usize,
+
+    #[clap(long, default_value = "1")]
+    pub num_receivers_per_sender: usize,
+
+    #[clap(long, default_value = "10000")]
+    pub num_messages: usize,
+
+    #[clap(long, default_value = "1000")]
+    pub hwm: i32,
+
+    #[clap(long, default_value = "500")]
+    pub batch_sleep_ms: u64,
+
+    #[clap(long, default_value = "1")]
+    pub num_dealer_pairs: usize,
+
+    #[clap(long, default_value = "1")]
+    pub num_dealerrouter_dealers: usize,
+
+    #[clap(long, value_delimiter = ',', default_value = "8,64,256,1024,4096")]
+    pub payload_sizes: Vec<usize>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     match args.command {
-        Command::Aggregator(args) => aggregator::run(args)?,
         Command::PubsubBenchmark(args) => {
             let total_tasks = args.num_senders * (1 + args.num_receivers_per_sender);
             let worker_threads = total_tasks.min(num_cpus::get());
@@ -143,6 +171,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(run_dealerrouter_benchmark(args))?;
+        }
+        Command::RunBenchmarks(args) => {
+            let rt = Builder::new_multi_thread()
+                .worker_threads(num_cpus::get())
+                .enable_all()
+                .build()?;
+            rt.block_on(run_benchmarks(args))?;
         }
     }
 
@@ -172,12 +207,10 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             format!("tcp://127.0.0.1:{}", 5000 + sender_id)
         };
 
-        for receiver_id in 0..args.num_receivers_per_sender {
+        for _receiver_id in 0..args.num_receivers_per_sender {
             let sub_args = subscriber::Args {
                 addresses: vec![address.clone()],
                 num_messages: args.num_messages,
-                id: format!("sub_{}_{}", sender_id, receiver_id),
-                benchmark_name: format!("PubSub-{}", args.transport.to_uppercase()),
                 payload_size: args.payload_size,
                 hwm: args.hwm,
             };
@@ -207,9 +240,10 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
         publisher_tasks.push(task);
     }
 
+    let mut histograms: Vec<Histogram<u64>> = Vec::new();
     for task in subscriber_tasks {
         match task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(h)) => histograms.push(h),
             Ok(Err(e)) => return Err(format!("Subscriber task failed: {}", e).into()),
             Err(e) => return Err(format!("Subscriber task join error: {}", e).into()),
         }
@@ -222,6 +256,17 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             Err(e) => return Err(format!("Publisher task join error: {}", e).into()),
         }
     }
+
+    let mut total_histogram = Histogram::<u64>::new(3)?;
+    for h in histograms {
+        total_histogram.add(h)?;
+    }
+    aggregator::append_benchmark_result(
+        "PubSub",
+        &args.transport.to_uppercase(),
+        args.payload_size,
+        &total_histogram,
+    )?;
 
     println!("Benchmark complete!");
     Ok(())
@@ -251,8 +296,6 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
             payload_size: args.payload_size,
             num_messages: args.num_messages,
             bind_address,
-            id: pair_id,
-            benchmark_name: format!("Dealer-{}", args.transport.to_uppercase()),
         };
 
         let task =
@@ -277,9 +320,10 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
         sender_tasks.push(task);
     }
 
+    let mut histograms: Vec<Histogram<u64>> = Vec::new();
     for task in receiver_tasks {
         match task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(h)) => histograms.push(h),
             Ok(Err(e)) => return Err(format!("Receiver task failed: {}", e).into()),
             Err(e) => return Err(format!("Receiver task join error: {}", e).into()),
         }
@@ -292,6 +336,17 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
             Err(e) => return Err(format!("Sender task join error: {}", e).into()),
         }
     }
+
+    let mut total_histogram = Histogram::<u64>::new(3)?;
+    for h in histograms {
+        total_histogram.add(h)?;
+    }
+    aggregator::append_benchmark_result(
+        "Dealer",
+        &args.transport.to_uppercase(),
+        args.payload_size,
+        &total_histogram,
+    )?;
 
     println!("Dealer benchmark complete!");
     Ok(())
@@ -339,7 +394,6 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
             router_address: router_address.clone(),
             dealer_id,
             num_dealers: args.num_dealers,
-            benchmark_name: format!("DealerRouter-{}", args.transport.to_uppercase()),
         };
 
         let end_barrier_clone = end_barrier.clone();
@@ -349,9 +403,10 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         dealer_tasks.push(task);
     }
 
+    let mut histograms: Vec<Histogram<u64>> = Vec::new();
     for task in dealer_tasks {
         match task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(h)) => histograms.push(h),
             Ok(Err(e)) => return Err(format!("Dealer task failed: {}", e).into()),
             Err(e) => return Err(format!("Dealer task join error: {}", e).into()),
         }
@@ -363,6 +418,162 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         Err(e) => return Err(format!("Router task join error: {}", e).into()),
     }
 
+    let mut total_histogram = Histogram::<u64>::new(3)?;
+    for h in histograms {
+        total_histogram.add(h)?;
+    }
+    aggregator::append_benchmark_result(
+        "DealerRouter",
+        &args.transport.to_uppercase(),
+        args.payload_size,
+        &total_histogram,
+    )?;
+
     println!("Dealer-router benchmark complete!");
+    Ok(())
+}
+
+async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
+    // Fresh start for full suite (matches original script behavior)
+    let _ = std::fs::remove_file("results.csv");
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "hgrm") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    println!("Starting benchmarks...");
+    println!(
+        "PUB/SUB Configuration: {} senders, {} receivers per sender, {} messages",
+        args.num_senders, args.num_receivers_per_sender, args.num_messages
+    );
+    println!(
+        "DEALER Configuration: {} pairs, {} messages",
+        args.num_dealer_pairs, args.num_messages
+    );
+    println!(
+        "DEALER-ROUTER Configuration: {} dealers (circular), {} messages (per dealer), High Water Mark: {}",
+        args.num_dealerrouter_dealers, args.num_messages, args.hwm
+    );
+    println!("Batch sleep: {}ms (PUB/SUB only)", args.batch_sleep_ms);
+    println!("");
+
+    println!("=== PUB/SUB Benchmarks ===");
+    for size in &args.payload_sizes {
+        println!("Running PUB/SUB IPC - Payload: {} bytes", size);
+
+        let bargs = PubsubBenchmarkArgs {
+            num_senders: args.num_senders,
+            num_receivers_per_sender: args.num_receivers_per_sender,
+            num_messages: args.num_messages,
+            payload_size: *size,
+            transport: "ipc".to_string(),
+            hwm: args.hwm,
+            batch_sleep_ms: args.batch_sleep_ms,
+        };
+        run_pubsub_benchmark(bargs).await?;
+
+        for i in 0..args.num_senders {
+            let _ = std::fs::remove_file(format!("/tmp/pub_{}.ipc", i));
+        }
+
+        println!("  Completed PUB/SUB IPC - Payload: {} bytes", size);
+        println!("");
+    }
+
+    for size in &args.payload_sizes {
+        println!("Running PUB/SUB TCP - Payload: {} bytes", size);
+
+        let bargs = PubsubBenchmarkArgs {
+            num_senders: args.num_senders,
+            num_receivers_per_sender: args.num_receivers_per_sender,
+            num_messages: args.num_messages,
+            payload_size: *size,
+            transport: "tcp".to_string(),
+            hwm: args.hwm,
+            batch_sleep_ms: args.batch_sleep_ms,
+        };
+        run_pubsub_benchmark(bargs).await?;
+
+        println!("  Completed PUB/SUB TCP - Payload: {} bytes", size);
+        println!("");
+    }
+
+    println!("=== DEALER Benchmarks ===");
+    for size in &args.payload_sizes {
+        println!("Running DEALER IPC - Payload: {} bytes", size);
+
+        let bargs = DealerBenchmarkArgs {
+            num_pairs: args.num_dealer_pairs,
+            num_messages: args.num_messages,
+            payload_size: *size,
+            transport: "ipc".to_string(),
+        };
+        run_dealer_benchmark(bargs).await?;
+
+        for i in 0..args.num_dealer_pairs {
+            let _ = std::fs::remove_file(format!("/tmp/dealer_{}.ipc", i));
+        }
+
+        println!("  Completed DEALER IPC - Payload: {} bytes", size);
+        println!("");
+    }
+
+    for size in &args.payload_sizes {
+        println!("Running DEALER TCP - Payload: {} bytes", size);
+
+        let bargs = DealerBenchmarkArgs {
+            num_pairs: args.num_dealer_pairs,
+            num_messages: args.num_messages,
+            payload_size: *size,
+            transport: "tcp".to_string(),
+        };
+        run_dealer_benchmark(bargs).await?;
+
+        println!("  Completed DEALER TCP - Payload: {} bytes", size);
+        println!("");
+    }
+
+    println!("=== DEALER-ROUTER Benchmarks ===");
+    for size in &args.payload_sizes {
+        println!("Running DEALER-ROUTER IPC - Payload: {} bytes", size);
+
+        let bargs = DealerRouterBenchmarkArgs {
+            num_dealers: args.num_dealerrouter_dealers,
+            num_messages: args.num_messages,
+            payload_size: *size,
+            transport: "ipc".to_string(),
+            hwm: args.hwm,
+            batch_sleep_ms: args.batch_sleep_ms,
+        };
+        run_dealerrouter_benchmark(bargs).await?;
+
+        let _ = std::fs::remove_file("/tmp/dealerrouter.ipc");
+
+        println!("  Completed DEALER-ROUTER IPC - Payload: {} bytes", size);
+        println!("");
+    }
+
+    for size in &args.payload_sizes {
+        println!("Running DEALER-ROUTER TCP - Payload: {} bytes", size);
+
+        let bargs = DealerRouterBenchmarkArgs {
+            num_dealers: args.num_dealerrouter_dealers,
+            num_messages: args.num_messages,
+            payload_size: *size,
+            transport: "tcp".to_string(),
+            hwm: args.hwm,
+            batch_sleep_ms: args.batch_sleep_ms,
+        };
+        run_dealerrouter_benchmark(bargs).await?;
+
+        println!("  Completed DEALER-ROUTER TCP - Payload: {} bytes", size);
+        println!("");
+    }
+
+    println!("All benchmarks complete! Results in results.csv");
     Ok(())
 }

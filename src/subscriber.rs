@@ -1,16 +1,12 @@
 use crate::zmq_helpers::{BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
-use hdrhistogram::serialization::Serializer;
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
-use std::fs::File;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
 pub struct Args {
     pub addresses: Vec<String>,
     pub num_messages: usize,
-    pub id: String,
-    pub benchmark_name: String,
     pub payload_size: usize,
     pub hwm: i32,
 }
@@ -21,7 +17,7 @@ fn extract_timestamp(buffer: &[u8]) -> u64 {
     ])
 }
 
-pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<(), BoxError> {
+pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<Histogram<u64>, BoxError> {
     tokio::task::spawn_blocking(move || {
         let context = Context::new();
         let subscriber = context.socket(zmq::SUB).box_err()?;
@@ -67,15 +63,7 @@ pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<(), BoxError> {
             );
         }
 
-        let filename = format!(
-            "{}_{}_{}.hgrm",
-            args.benchmark_name, args.payload_size, args.id
-        );
-        let mut file = File::create(&filename)?;
-        let mut serializer = hdrhistogram::serialization::V2Serializer::new();
-        serializer.serialize(&histogram, &mut file).box_err()?;
-
-        Ok(())
+        Ok(histogram)
     })
     .await
     .join_err()

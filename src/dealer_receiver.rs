@@ -1,8 +1,6 @@
 use crate::zmq_helpers::{BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
-use hdrhistogram::serialization::Serializer;
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
-use std::fs::File;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -10,8 +8,6 @@ pub struct Args {
     pub payload_size: usize,
     pub num_messages: usize,
     pub bind_address: String,
-    pub id: usize,
-    pub benchmark_name: String,
 }
 
 fn extract_timestamp(buffer: &[u8]) -> u64 {
@@ -20,7 +16,7 @@ fn extract_timestamp(buffer: &[u8]) -> u64 {
     ])
 }
 
-pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<(), BoxError> {
+pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<Histogram<u64>, BoxError> {
     tokio::task::spawn_blocking(move || {
         let context = Context::new();
         let dealer = context.socket(zmq::DEALER).box_err()?;
@@ -49,22 +45,12 @@ pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<(), BoxError> {
             histogram.record(latency_ns).box_err()?;
         }
 
-        let filename = format!(
-            "{}_{}_{}.hgrm",
-            args.benchmark_name,
-            args.payload_size,
-            format!("receiver_{}", args.id)
-        );
-        let mut file = File::create(&filename)?;
-        let mut serializer = hdrhistogram::serialization::V2Serializer::new();
-        serializer.serialize(&histogram, &mut file).box_err()?;
-
         if args.bind_address.starts_with("ipc://") {
             let path = args.bind_address.trim_start_matches("ipc://");
             let _ = std::fs::remove_file(path);
         }
 
-        Ok(())
+        Ok(histogram)
     })
     .await
     .join_err()

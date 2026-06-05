@@ -1,8 +1,6 @@
 use crate::zmq_helpers::{BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
-use hdrhistogram::serialization::Serializer;
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
-use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -19,7 +17,6 @@ pub struct Args {
     pub router_address: String,
     pub dealer_id: usize,
     pub num_dealers: usize,
-    pub benchmark_name: String,
 }
 
 fn extract_timestamp(buffer: &[u8]) -> u64 {
@@ -32,14 +29,14 @@ pub async fn run_async(
     args: Args,
     end_barrier: Arc<Barrier>,
     tsc_per_ns: f64,
-) -> Result<(), BoxError> {
+) -> Result<Histogram<u64>, BoxError> {
     let sender_id = args.dealer_id * 2;
     let receiver_id = args.dealer_id * 2 + 1;
     let target_receiver_id = ((args.dealer_id + 1) % args.num_dealers) * 2 + 1;
 
     let recv_args = args.clone();
     let recv_end_barrier = end_barrier.clone();
-    let recv_handle = tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+    let recv_handle = tokio::task::spawn_blocking(move || -> Result<Histogram<u64>, BoxError> {
         let context = Context::new();
         let receiver = context.socket(zmq::DEALER).box_err()?;
 
@@ -71,17 +68,7 @@ pub async fn run_async(
             histogram.record(latency_ns).box_err()?;
         }
 
-        let filename = format!(
-            "{}_{}_{}.hgrm",
-            recv_args.benchmark_name,
-            recv_args.payload_size,
-            format!("dealer_{}", recv_args.dealer_id)
-        );
-        let mut file = File::create(&filename)?;
-        let mut serializer = hdrhistogram::serialization::V2Serializer::new();
-        serializer.serialize(&histogram, &mut file).box_err()?;
-
-        Ok(())
+        Ok(histogram)
     });
 
     let send_args = args.clone();
@@ -120,7 +107,7 @@ pub async fn run_async(
     });
 
     send_handle.await.join_err()?;
-    recv_handle.await.join_err()?;
+    let histogram = recv_handle.await.join_err()?;
 
-    Ok(())
+    Ok(histogram)
 }

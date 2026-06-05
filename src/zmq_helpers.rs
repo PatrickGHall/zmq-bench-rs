@@ -36,14 +36,14 @@ impl<T> HdrResultExt<T> for Result<T, hdrhistogram::serialization::V2SerializeEr
     }
 }
 
-pub trait JoinResultExt {
-    fn join_err(self) -> Result<(), BoxError>;
+pub trait JoinResultExt<T> {
+    fn join_err(self) -> Result<T, BoxError>;
 }
 
-impl JoinResultExt for Result<Result<(), BoxError>, JoinError> {
-    fn join_err(self) -> Result<(), BoxError> {
+impl<T> JoinResultExt<T> for Result<Result<T, BoxError>, JoinError> {
+    fn join_err(self) -> Result<T, BoxError> {
         match self {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(t)) => Ok(t),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(Box::new(IoError::new(
                 ErrorKind::Other,
