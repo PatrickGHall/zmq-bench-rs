@@ -3,9 +3,10 @@ use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Builder;
-use tokio::sync::Barrier;
+use tokio::sync::{oneshot, Barrier};
 mod aggregator;
 mod dealer_receiver;
 mod dealer_sender;
@@ -197,6 +198,11 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
         tsc_per_ns, tsc_per_ns
     );
 
+    // Shared across all publishers in this benchmark run for measuring
+    // synchronization phase (any hello start) to benchmark phase (last real start).
+    let first_hello_tsc = Arc::new(AtomicU64::new(u64::MAX));
+    let last_bench_start_tsc = Arc::new(AtomicU64::new(0));
+
     let mut subscriber_tasks = Vec::new();
     let mut publisher_tasks = Vec::new();
 
@@ -207,7 +213,11 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             format!("tcp://127.0.0.1:{}", 5000 + sender_id)
         };
 
+        let mut hello_acks = Vec::new();
         for _receiver_id in 0..args.num_receivers_per_sender {
+            let (hello_ack_tx, hello_ack_rx) = oneshot::channel();
+            hello_acks.push(hello_ack_rx);
+
             let sub_args = subscriber::Args {
                 addresses: vec![address.clone()],
                 num_messages: args.num_messages,
@@ -215,18 +225,30 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
                 hwm: args.hwm,
             };
 
-            let task =
-                tokio::spawn(async move { subscriber::run_async(sub_args, tsc_per_ns).await });
+            let task = tokio::spawn(async move {
+                subscriber::run_async(sub_args, tsc_per_ns, Some(hello_ack_tx)).await
+            });
             subscriber_tasks.push(task);
         }
-    }
 
-    for sender_id in 0..args.num_senders {
-        let address = if args.transport == "ipc" {
-            format!("ipc:///tmp/pub_{}.ipc", sender_id)
-        } else {
-            format!("tcp://127.0.0.1:{}", 5000 + sender_id)
-        };
+        // Hello-phase coordinator: wait until all subscribers for this publisher have
+        // received (and acked) at least one hello on the data path. Then tell the
+        // publisher (via the atomic) to stop sending hellos and send real benchmark data.
+        // Use a timeout so a missing hello from one sub doesn't hang the entire run
+        // (liveness); force the phase on timeout and proceed (some subs may see drops).
+        let bench_phase = Arc::new(AtomicBool::new(false));
+        let bench_phase_for_coordinator = bench_phase.clone();
+        tokio::spawn(async move {
+            let sync_timeout = std::time::Duration::from_secs(30);
+            let _ = tokio::time::timeout(sync_timeout, async {
+                for rx in hello_acks {
+                    let _ = rx.await;
+                }
+            }).await;
+            // On timeout we still force the phase (best effort); the warning is emitted
+            // by the publisher side or via partial collection results.
+            bench_phase_for_coordinator.store(true, Ordering::Release);
+        });
 
         let pub_args = publisher::Args {
             payload_size: args.payload_size,
@@ -236,7 +258,17 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             batch_sleep_ms: args.batch_sleep_ms,
         };
 
-        let task = tokio::spawn(async move { publisher::run_async(pub_args).await });
+        let first_clone = first_hello_tsc.clone();
+        let last_clone = last_bench_start_tsc.clone();
+        let task = tokio::spawn(async move {
+            publisher::run_async(
+                pub_args,
+                Some(bench_phase),
+                Some(first_clone),
+                Some(last_clone),
+            )
+            .await
+        });
         publisher_tasks.push(task);
     }
 
@@ -255,6 +287,20 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             Ok(Err(e)) => return Err(format!("Publisher task failed: {}", e).into()),
             Err(e) => return Err(format!("Publisher task join error: {}", e).into()),
         }
+    }
+
+    // Print synchronization phase duration (time from first hello send start
+    // by any sender, to the start of the first real benchmark send by the last sender).
+    let first = first_hello_tsc.load(Ordering::Relaxed);
+    let last = last_bench_start_tsc.load(Ordering::Relaxed);
+    if last > first && first != u64::MAX {
+        let delta_tsc = last - first;
+        let ns = (delta_tsc as f64 / tsc_per_ns) as u64;
+        println!(
+            "Synchronization phase duration: {} ns ({:.3} ms)",
+            ns,
+            ns as f64 / 1_000_000.0
+        );
     }
 
     let mut total_histogram = Histogram::<u64>::new(3)?;
@@ -282,6 +328,10 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
         tsc_per_ns, tsc_per_ns
     );
 
+    // Shared for measuring synchronization phase across all pairs in this run.
+    let first_hello_tsc = Arc::new(AtomicU64::new(u64::MAX));
+    let last_bench_start_tsc = Arc::new(AtomicU64::new(0));
+
     let mut receiver_tasks = Vec::new();
     let mut sender_tasks = Vec::new();
 
@@ -292,18 +342,29 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
             format!("tcp://127.0.0.1:{}", 6000 + pair_id)
         };
 
+        let (hello_ack_tx, hello_ack_rx) = oneshot::channel();
         let recv_args = dealer_receiver::Args {
             payload_size: args.payload_size,
             num_messages: args.num_messages,
             bind_address,
         };
 
-        let task =
-            tokio::spawn(async move { dealer_receiver::run_async(recv_args, tsc_per_ns).await });
+        let task = tokio::spawn(async move {
+            dealer_receiver::run_async(recv_args, tsc_per_ns, Some(hello_ack_tx)).await
+        });
         receiver_tasks.push(task);
-    }
 
-    for pair_id in 0..args.num_pairs {
+        // Coordinator: wait for the receiver to receive (and ack) a hello on the
+        // data path, then tell the sender (via the atomic) to switch from hello to real data.
+        // Timeout to avoid hang if hello not delivered (force proceed).
+        let bench_phase = Arc::new(AtomicBool::new(false));
+        let bench_phase_for_coordinator = bench_phase.clone();
+        tokio::spawn(async move {
+            let sync_timeout = std::time::Duration::from_secs(30);
+            let _ = tokio::time::timeout(sync_timeout, hello_ack_rx).await;
+            bench_phase_for_coordinator.store(true, Ordering::Release);
+        });
+
         let receiver_address = if args.transport == "ipc" {
             format!("ipc:///tmp/dealer_{}.ipc", pair_id)
         } else {
@@ -316,7 +377,17 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
             receiver_address,
         };
 
-        let task = tokio::spawn(async move { dealer_sender::run_async(send_args).await });
+        let first_clone = first_hello_tsc.clone();
+        let last_clone = last_bench_start_tsc.clone();
+        let task = tokio::spawn(async move {
+            dealer_sender::run_async(
+                send_args,
+                Some(bench_phase),
+                Some(first_clone),
+                Some(last_clone),
+            )
+            .await
+        });
         sender_tasks.push(task);
     }
 
@@ -335,6 +406,19 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
             Ok(Err(e)) => return Err(format!("Sender task failed: {}", e).into()),
             Err(e) => return Err(format!("Sender task join error: {}", e).into()),
         }
+    }
+
+    // Print synchronization phase duration.
+    let first = first_hello_tsc.load(Ordering::Relaxed);
+    let last = last_bench_start_tsc.load(Ordering::Relaxed);
+    if last > first && first != u64::MAX {
+        let delta_tsc = last - first;
+        let ns = (delta_tsc as f64 / tsc_per_ns) as u64;
+        println!(
+            "Synchronization phase duration: {} ns ({:.3} ms)",
+            ns,
+            ns as f64 / 1_000_000.0
+        );
     }
 
     let mut total_histogram = Histogram::<u64>::new(3)?;
@@ -364,6 +448,10 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         tsc_per_ns, tsc_per_ns
     );
 
+    // Shared for the dealerrouter run: synchronization phase measurement.
+    let first_hello_tsc = Arc::new(AtomicU64::new(u64::MAX));
+    let last_bench_start_tsc = Arc::new(AtomicU64::new(0));
+
     let end_barrier = Arc::new(Barrier::new(args.num_dealers + 1));
 
     let router_address = if args.transport == "ipc" {
@@ -385,7 +473,14 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
     });
 
     let mut dealer_tasks = Vec::new();
+    let mut hello_acks = Vec::new();
+    let mut bench_phases = Vec::new();
     for dealer_id in 0..args.num_dealers {
+        let (hello_ack_tx, hello_ack_rx) = oneshot::channel();
+        let bench_phase = Arc::new(AtomicBool::new(false));
+        hello_acks.push(hello_ack_rx);
+        bench_phases.push(bench_phase.clone());
+
         let dealer_args = dealerrouter_dealer::Args {
             payload_size: args.payload_size,
             num_messages: args.num_messages,
@@ -397,11 +492,38 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         };
 
         let end_barrier_clone = end_barrier.clone();
+        let first_clone = first_hello_tsc.clone();
+        let last_clone = last_bench_start_tsc.clone();
         let task = tokio::spawn(async move {
-            dealerrouter_dealer::run_async(dealer_args, end_barrier_clone, tsc_per_ns).await
+            dealerrouter_dealer::run_async(
+                dealer_args,
+                hello_ack_tx,
+                Some(bench_phase),
+                Some(first_clone),
+                Some(last_clone),
+                end_barrier_clone,
+                tsc_per_ns,
+            )
+            .await
         });
         dealer_tasks.push(task);
     }
+
+    // Hello-phase coordinator: wait until *all* receiving dealers have received
+    // (and acked) at least one hello on the data path. Then tell every sending
+    // dealer (via their atomic) to switch from hello to real benchmark data.
+    // Timeout to avoid liveness hang on missing hello.
+    tokio::spawn(async move {
+        let sync_timeout = std::time::Duration::from_secs(30);
+        let _ = tokio::time::timeout(sync_timeout, async {
+            for rx in hello_acks {
+                let _ = rx.await;
+            }
+        }).await;
+        for phase in bench_phases {
+            phase.store(true, Ordering::Release);
+        }
+    });
 
     let mut histograms: Vec<Histogram<u64>> = Vec::new();
     for task in dealer_tasks {
@@ -410,6 +532,19 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
             Ok(Err(e)) => return Err(format!("Dealer task failed: {}", e).into()),
             Err(e) => return Err(format!("Dealer task join error: {}", e).into()),
         }
+    }
+
+    // Print synchronization phase duration for dealerrouter.
+    let first = first_hello_tsc.load(Ordering::Relaxed);
+    let last = last_bench_start_tsc.load(Ordering::Relaxed);
+    if last > first && first != u64::MAX {
+        let delta_tsc = last - first;
+        let ns = (delta_tsc as f64 / tsc_per_ns) as u64;
+        println!(
+            "Synchronization phase duration: {} ns ({:.3} ms)",
+            ns,
+            ns as f64 / 1_000_000.0
+        );
     }
 
     match router_task.await {

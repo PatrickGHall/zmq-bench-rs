@@ -1,4 +1,4 @@
-use crate::zmq_helpers::{BoxError, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{is_begin_marker, is_hello_marker, BoxError, JoinResultExt, ZmqResultExt};
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use zmq::Context;
@@ -21,15 +21,27 @@ pub async fn run_async(args: Args, end_barrier: Arc<Barrier>) -> Result<(), BoxE
 
         router.bind(&args.bind_address).box_err()?;
 
-        let total_messages = args.num_dealers * args.num_messages_per_dealer;
+        let total_data_messages = args.num_dealers * args.num_messages_per_dealer;
+        let mut data_forwarded = 0usize;
 
-        for _ in 0..total_messages {
+        while data_forwarded < total_data_messages {
             let _sender_id = router.recv_msg(0).box_err()?;
             let dest_id = router.recv_msg(0).box_err()?;
             let payload = router.recv_msg(0).box_err()?;
 
+            // Inspect *before* consuming the payload in the send.
+            // Control messages (hellos + the one begin per sender from the synchronization
+            // phase) must be forwarded (so receivers see the cutover), but do not count
+            // toward the benchmark data total.
+            let pbytes: &[u8] = payload.as_ref();
+            let is_control = is_hello_marker(pbytes) || is_begin_marker(pbytes);
+
             router.send(dest_id, zmq::SNDMORE).box_err()?;
             router.send(payload, 0).box_err()?;
+
+            if !is_control {
+                data_forwarded += 1;
+            }
         }
 
         let handle = tokio::runtime::Handle::current();

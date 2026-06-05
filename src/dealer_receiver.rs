@@ -1,6 +1,7 @@
-use crate::zmq_helpers::{BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{is_begin_marker, is_hello_marker, BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
+use tokio::sync::oneshot;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -10,13 +11,7 @@ pub struct Args {
     pub bind_address: String,
 }
 
-fn extract_timestamp(buffer: &[u8]) -> u64 {
-    u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ])
-}
-
-pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<Histogram<u64>, BoxError> {
+pub async fn run_async(args: Args, tsc_per_ns: f64, mut hello_ack_tx: Option<oneshot::Sender<()>>) -> Result<Histogram<u64>, BoxError> {
     tokio::task::spawn_blocking(move || {
         let context = Context::new();
         let dealer = context.socket(zmq::DEALER).box_err()?;
@@ -27,11 +22,41 @@ pub async fn run_async(args: Args, tsc_per_ns: f64) -> Result<Histogram<u64>, Bo
         let ack = vec![0u8; 8];
         let mut latencies = Vec::with_capacity(args.num_messages);
 
+        // Synchronization phase drain (hellos + explicit begin cutover):
+        // Reply on *every* message during drain (hellos and the begin) to keep the
+        // sender's send+recv-reply loop from blocking. Ack harness only on first hello.
+        // When begin marker seen, reply and cut over. The for loop below then receives
+        // exactly the num real benchmark phase messages with a completely clean path.
+        loop {
+            dealer.recv_into(&mut recv_buffer, 0).box_err()?;
+
+            if is_hello_marker(&recv_buffer) {
+                if hello_ack_tx.is_some() {
+                    if let Some(tx) = hello_ack_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                dealer.send(&ack, 0).box_err()?; // keep sender progressing
+                continue;
+            }
+            if is_begin_marker(&recv_buffer) {
+                dealer.send(&ack, 0).box_err()?; // reply to the begin too
+                break;
+            }
+            // real tsc before begin (edge): reply and eat to preserve count in collection
+            dealer.send(&ack, 0).box_err()?;
+            continue;
+        }
+
+        // Clean benchmark phase -- exactly num real messages.
+        // No phase markers, no hello tests, no harness acks, no extra branches.
+        // Only the ZMQ interactions required by the benchmark (recv + send ack)
+        // plus the TSC work.
         for _ in 0..args.num_messages {
             dealer.recv_into(&mut recv_buffer, 0).box_err()?;
 
             let recv_tsc = unsafe { _rdtsc() };
-            let sent_tsc = extract_timestamp(&recv_buffer);
+            let sent_tsc = crate::zmq_helpers::extract_timestamp(&recv_buffer);
 
             latencies.push(recv_tsc - sent_tsc);
 
