@@ -1,10 +1,25 @@
 use crate::zmq_helpers::{
     is_begin_marker, is_hello_marker, maybe_pin_for_bench, maybe_remove_ipc,
     finalize_measurements, hwm, BoxError, JoinResultExt, ZmqResultExt,
-    BEGIN_BENCHMARK_MARKER, SyncPhase, compute_hot_loop_timeout,
+    BEGIN_BENCHMARK_MARKER, HELLO_MARKER, SyncPhase, compute_hot_loop_timeout,
     make_socket, register_dirty_state, cleanup_dirty_state,
-    record_first_hello, record_bench_start, extract_timestamp,
+    record_first_hello, record_bench_start, read_leading_u64,
 };
+
+/// Build a ZMQ endpoint for the chosen transport: an IPC socket file under /tmp
+/// or a loopback TCP port.
+fn endpoint(transport: &str, ipc_name: &str, tcp_port: u16) -> String {
+    if transport == "ipc" {
+        format!("ipc:///tmp/{}.ipc", ipc_name)
+    } else {
+        format!("tcp://127.0.0.1:{}", tcp_port)
+    }
+}
+
+/// The CSV/label transport name ("IPC"/"TCP") for an endpoint address.
+fn transport_label(addr: &str) -> &'static str {
+    if addr.starts_with("ipc") { "IPC" } else { "TCP" }
+}
 
 /// Wait on the end barrier with an upper bound. The barrier rendezvous (router
 /// finished forwarding <-> dealers finished receiving) completes in microseconds
@@ -20,20 +35,12 @@ fn end_barrier_wait_bounded(b: &Barrier) {
     });
 }
 
-#[derive(Clone)]
-pub(crate) struct SyncHandles {
-    pub first: Arc<AtomicU64>,
-    pub last: Arc<AtomicU64>,
-}
-
-impl SyncHandles {
-    pub fn from_sync(sync: &SyncPhase) -> Self {
-        Self {
-            first: sync.first_hello_tsc.clone(),
-            last: sync.last_bench_start_tsc.clone(),
-        }
-    }
-}
+/// A task producing one receiver's latency histogram.
+type HistTask = JoinHandle<Result<Histogram<u64>, BoxError>>;
+/// A task that only needs to run to completion (sender / router).
+type CompletionTask = JoinHandle<Result<(), BoxError>>;
+/// Tasks launched for one benchmark: histogram producers and completion-only tasks.
+type LaunchedTasks = (Vec<HistTask>, Vec<CompletionTask>);
 
 #[derive(Clone, Debug)]
 pub(crate) enum Pattern {
@@ -84,7 +91,7 @@ impl Pattern {
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, Barrier};
 use tokio::task::JoinHandle;
@@ -96,12 +103,11 @@ pub(crate) async fn run_publisher(
     num_messages: usize,
     address: String,
     bench_phase: Option<Arc<AtomicBool>>,
-    sync: SyncHandles,
+    sync: SyncPhase,
     reals_start_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
     let addr = address.clone();
     let addr_for_remove = addr.clone();
-    let sh = sync;
     let n = num_messages;
     let handle = spawn_measurement_sender(
         payload_size,
@@ -114,7 +120,7 @@ pub(crate) async fn run_publisher(
             Ok(p)
         },
         bench_phase,
-        sh,
+        sync,
         reals_start_rx,
         |s, b, _ack| s.send(&b[..], 0).box_err(),
         move |s, b| hot_send_tsc(s, b, n),
@@ -130,7 +136,7 @@ pub(crate) async fn run_subscriber(
     hello_ack_tx: Option<oneshot::Sender<()>>,
     begin_ack_tx: Option<oneshot::Sender<()>>,
 ) -> Result<Histogram<u64>, BoxError> {
-    let transport = if addresses.first().map_or(false, |a| a.starts_with("ipc")) { "IPC" } else { "TCP" };
+    let transport = addresses.first().map(|a| transport_label(a)).unwrap_or("TCP");
     let addrs = addresses.clone();
     let handle = spawn_measurement_receiver(
         hello_ack_tx,
@@ -164,10 +170,9 @@ pub(crate) async fn run_sender(
     num_messages: usize,
     receiver_address: String,
     bench_phase: Option<Arc<AtomicBool>>,
-    sync: SyncHandles,
+    sync: SyncPhase,
 ) -> Result<(), BoxError> {
     let addr = receiver_address.clone();
-    let sh = sync;
     let n = num_messages;
     let handle = spawn_measurement_sender(
         payload_size,
@@ -180,7 +185,7 @@ pub(crate) async fn run_sender(
             Ok(d)
         },
         bench_phase,
-        sh,
+        sync,
         None,
         |s, b, ack| {
             s.send(&b[..], 0).box_err()?;
@@ -199,7 +204,7 @@ pub(crate) async fn run_receiver(
     bind_address: String,
     hello_ack_tx: Option<oneshot::Sender<()>>,
 ) -> Result<Histogram<u64>, BoxError> {
-    let transport = if bind_address.starts_with("ipc") { "IPC" } else { "TCP" };
+    let transport = transport_label(&bind_address);
     let addr = bind_address.clone();
     let addr_for_remove = addr.clone();
     let handle = spawn_measurement_receiver(
@@ -228,6 +233,7 @@ pub(crate) async fn run_receiver(
 
 
 
+#[allow(clippy::too_many_arguments)] // wires up two sockets + sync/barrier handles for one ring node
 pub(crate) async fn run_dealer(
     payload_size: usize,
     num_messages: usize,
@@ -236,59 +242,52 @@ pub(crate) async fn run_dealer(
     num_dealers: usize,
     hello_ack_tx: oneshot::Sender<()>,
     bench_phase: Option<Arc<AtomicBool>>,
-    sync: SyncHandles,
+    sync: SyncPhase,
     end_barrier: Arc<Barrier>,
 ) -> Result<Histogram<u64>, BoxError> {
+    // Each dealer owns a sender (id 2k) and a receiver (id 2k+1) and forwards to
+    // the next dealer's receiver, forming a ring through the router.
     let sender_id = dealer_id * 2;
     let receiver_id = dealer_id * 2 + 1;
     let target_receiver_id = ((dealer_id + 1) % num_dealers) * 2 + 1;
+    let transport = transport_label(&router_address);
 
-    let hello_ack_tx = Some(hello_ack_tx);
-    let recv_end_barrier = end_barrier.clone();
-    let raddr_for_recv = router_address.clone();
-    let recv_id = receiver_id;
-    let raddr = raddr_for_recv.clone();
+    let recv_addr = router_address.clone();
     let recv_handle = spawn_measurement_receiver(
-        hello_ack_tx,
+        Some(hello_ack_tx),
         None,
         move || {
             let receiver = make_socket(
-                zmq::DEALER,
-                None,
-                Some(hwm(num_messages)),
-                Some(format!("dealer_{}", recv_id).as_bytes()),
+                zmq::DEALER, None, Some(hwm(num_messages)),
+                Some(format!("dealer_{}", receiver_id).as_bytes()),
             )?;
-            receiver.connect(&raddr).box_err()?;
+            receiver.connect(&recv_addr).box_err()?;
             Ok(receiver)
         },
         None,
-        Some(recv_end_barrier),
+        Some(end_barrier),
         None,
         "DealerRouter",
-        if raddr_for_recv.starts_with("ipc") { "IPC" } else { "TCP" },
+        transport,
         payload_size,
         num_messages,
         true,
     );
 
-    let first_send = sync.first.clone();
-    let last_send = sync.last.clone();
-
-    let dest_id = format!("dealer_{}", target_receiver_id).into_bytes();
-    let sh = SyncHandles { first: first_send, last: last_send };
+    let dest = format!("dealer_{}", target_receiver_id).into_bytes();
     let n = num_messages;
-    let dest = dest_id.clone();
     let send_handle = spawn_measurement_sender(
         payload_size,
         move || {
             let s = make_socket(
-                zmq::DEALER, Some(hwm(num_messages)), None, Some(format!("dealer_{}", sender_id).as_bytes()),
+                zmq::DEALER, Some(hwm(num_messages)), None,
+                Some(format!("dealer_{}", sender_id).as_bytes()),
             )?;
             s.connect(&router_address).box_err()?;
             Ok(s)
         },
         bench_phase,
-        sh,
+        sync,
         None,
         {
             let d = dest.clone();
@@ -298,10 +297,7 @@ pub(crate) async fn run_dealer(
                 Ok(())
             }
         },
-        {
-            let d = dest;
-            move |s, b| hot_send_tsc_multipart(s, &d, b, n)
-        },
+        move |s, b| hot_send_tsc_multipart(s, &dest, b, n),
         None,
     );
 
@@ -383,8 +379,7 @@ fn router_forward_reliable(router: &zmq::Socket, dest: &zmq::Message, payload: &
             {
                 std::thread::yield_now();
             }
-            Err(e) => return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(e) => return Err(Box::new(std::io::Error::other(
                 format!("router forward failed (peer unreachable for {:?}): {}",
                         start.elapsed(), e),
             ))),
@@ -401,17 +396,12 @@ pub(crate) fn launch_pubsub(
     payload_size: usize,
     num_messages: usize,
     sync: &SyncPhase,
-) -> (Vec<JoinHandle<Result<Histogram<u64>, BoxError>>>,
-      Vec<JoinHandle<Result<(), BoxError>>>) {
+) -> LaunchedTasks {
     let mut hist_tasks = Vec::new();
     let mut completion_tasks = Vec::new();
 
     for sender_id in 0..num_senders {
-        let address = if transport == "ipc" {
-            format!("ipc:///tmp/pub_{}.ipc", sender_id)
-        } else {
-            format!("tcp://127.0.0.1:{}", 5000 + sender_id)
-        };
+        let address = endpoint(transport, &format!("pub_{}", sender_id), (5000 + sender_id) as u16);
 
         let mut hello_acks = Vec::new();
         let mut begin_acks = Vec::new();
@@ -438,7 +428,7 @@ pub(crate) fn launch_pubsub(
             let _ = reals_tx.send(());
         });
 
-        let sh = SyncHandles::from_sync(sync);
+        let sh = sync.clone();
         completion_tasks.push(tokio::spawn(async move {
             run_publisher(payload_size, num_messages, address.clone(), Some(bench_phase), sh, Some(reals_rx)).await
         }));
@@ -452,17 +442,12 @@ pub(crate) fn launch_dealer(
     payload_size: usize,
     num_messages: usize,
     sync: &SyncPhase,
-) -> (Vec<JoinHandle<Result<Histogram<u64>, BoxError>>>,
-      Vec<JoinHandle<Result<(), BoxError>>>) {
+) -> LaunchedTasks {
     let mut hist_tasks = Vec::new();
     let mut completion_tasks = Vec::new();
 
     for pair_id in 0..num_pairs {
-        let addr = if transport == "ipc" {
-            format!("ipc:///tmp/dealer_{}.ipc", pair_id)
-        } else {
-            format!("tcp://127.0.0.1:{}", 6000 + pair_id)
-        };
+        let addr = endpoint(transport, &format!("dealer_{}", pair_id), (6000 + pair_id) as u16);
 
         let (hello_tx, hello_rx) = oneshot::channel();
         let value = addr.clone();
@@ -476,7 +461,7 @@ pub(crate) fn launch_dealer(
             bp2.store(true, Ordering::Release);
         });
 
-        let sh = SyncHandles::from_sync(sync);
+        let sh = sync.clone();
         completion_tasks.push(tokio::spawn(async move {
             run_sender(payload_size, num_messages, addr.clone(), Some(bp), sh).await
         }));
@@ -490,16 +475,11 @@ pub(crate) fn launch_dealerrouter(
     payload_size: usize,
     num_messages: usize,
     sync: &SyncPhase,
-) -> (Vec<JoinHandle<Result<Histogram<u64>, BoxError>>>,
-      Vec<JoinHandle<Result<(), BoxError>>>) {
+) -> LaunchedTasks {
     let mut hist_tasks = Vec::new();
     let mut completion_tasks = Vec::new();
 
-    let router_addr = if transport == "ipc" {
-        "ipc:///tmp/dealerrouter.ipc".to_string()
-    } else {
-        "tcp://127.0.0.1:7000".to_string()
-    };
+    let router_addr = endpoint(transport, "dealerrouter", 7000);
 
     let end_barrier = Arc::new(Barrier::new(num_dealers + 1));
     {
@@ -516,7 +496,7 @@ pub(crate) fn launch_dealerrouter(
         hello_acks.push(h_rx);
         bench_phases.push(bp.clone());
 
-        let sh = SyncHandles::from_sync(sync);
+        let sh = sync.clone();
         let b = end_barrier.clone();
         let raddr2 = router_addr.clone();
         hist_tasks.push(tokio::spawn(async move {
@@ -544,12 +524,17 @@ pub(crate) fn cleanup_ipc(prefix: &str, n: usize) {
     }
 }
 
+/// How long the coordinator waits for every receiver's HELLO ack before
+/// declaring the handshake broken. The phase is sub-millisecond when healthy, so
+/// this only bounds a genuine setup failure.
+const SYNC_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn spawn_coordinator(
     rxs: Vec<oneshot::Receiver<()>>,
     action: impl FnOnce() + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let timed_out = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let timed_out = tokio::time::timeout(SYNC_ACK_TIMEOUT, async {
             for rx in rxs {
                 let _ = rx.await;
             }
@@ -591,8 +576,7 @@ fn drain_sync_phase(
                     ),
                 )));
             }
-            Err(e) => return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other, e.to_string()))),
+            Err(e) => return Err(Box::new(std::io::Error::other(e.to_string()))),
         }
         if is_hello_marker(buffer) {
             if let Some(tx) = hello_ack.take() {
@@ -624,6 +608,7 @@ const HELLO_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 const HELLO_DRAIN_RCVTIMEO_MS: i32 = 1000; // sync phase is sub-ms healthy; one expired window already signals a setup problem
 const HELLO_DRAIN_MAX_EAGAIN: u32 = 1; // tolerate a single slow window, then fail fast (~2s total) for quick debugging
 
+#[allow(clippy::too_many_arguments)] // generic receiver harness: handshake channels, socket builder, and reporting metadata
 fn spawn_measurement_receiver(
     hello_ack_tx: Option<oneshot::Sender<()>>,
     begin_ack_tx: Option<oneshot::Sender<()>>,
@@ -684,11 +669,12 @@ fn spawn_measurement_receiver(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // generic sender harness: socket builder, sync handles, and the two send closures
 fn spawn_measurement_sender(
     payload_size: usize,
     make_socket: impl FnOnce() -> Result<zmq::Socket, BoxError> + Send + 'static,
     bench_phase: Option<Arc<AtomicBool>>,
-    sync: SyncHandles,
+    sync: SyncPhase,
     reals_start_rx: Option<oneshot::Receiver<()>>,
     // Same action drives both sync markers (HELLO and BEGIN): send the framed
     // buffer and, for request/reply patterns, consume the ack.
@@ -712,9 +698,9 @@ fn spawn_measurement_sender(
             // so the resend can't flood the send-HWM ahead of bench_phase (an
             // unthrottled loop pushed tens of thousands of HELLOs and stalled
             // forwarding); a healthy handshake completes in a handful of HELLOs.
-            buf[0..8].copy_from_slice(&0u64.to_le_bytes());
+            buf[0..8].copy_from_slice(&HELLO_MARKER.to_le_bytes());
             loop {
-                record_first_hello(Some(&sync.first));
+                record_first_hello(&sync.first_hello_tsc);
                 sync_action(&socket, &mut buf, &mut ack_buf)?;
                 match &bench_phase {
                     Some(phase) if !phase.load(Ordering::Acquire) => {
@@ -727,9 +713,9 @@ fn spawn_measurement_sender(
             buf[0..8].copy_from_slice(&BEGIN_BENCHMARK_MARKER.to_le_bytes());
             sync_action(&socket, &mut buf, &mut ack_buf)?;
 
-            record_bench_start(Some(&sync.last));
+            record_bench_start(&sync.last_bench_start_tsc);
             if let Some(rx) = reals_start_rx {
-                let _ = handle.block_on(async { rx.await });
+                let _ = handle.block_on(rx);
             }
 
             hot_action(&socket, &mut buf)?;
@@ -804,7 +790,7 @@ fn hot_recv_tsc(
         match socket.recv_into(buf, 0) {
             Ok(_) => {
                 let recv_tsc = unsafe { _rdtsc() };
-                let sent_tsc = extract_timestamp(buf);
+                let sent_tsc = read_leading_u64(buf);
                 latencies.push(recv_tsc - sent_tsc);
                 unsafe { cpus.push(libc::sched_getcpu()); }
                 received += 1;

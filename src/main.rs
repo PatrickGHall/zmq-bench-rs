@@ -34,6 +34,25 @@ enum Command {
     RunBenchmarks(RunBenchmarksArgs),
 }
 
+/// Knobs shared by every single-pattern benchmark subcommand.
+#[derive(Parser, Debug)]
+struct CommonArgs {
+    #[clap(long, default_value = "10000")]
+    pub num_messages: usize,
+
+    #[clap(long, default_value = "64")]
+    pub payload_size: usize,
+
+    #[clap(long, default_value = "ipc")]
+    pub transport: String,
+
+    #[clap(long)]
+    pub save_hists: bool,
+
+    #[clap(long, default_value = "results.csv")]
+    pub output: String,
+}
+
 #[derive(Parser, Debug)]
 struct PubsubBenchmarkArgs {
     #[clap(long, default_value = "1")]
@@ -42,20 +61,8 @@ struct PubsubBenchmarkArgs {
     #[clap(long, default_value = "1")]
     pub num_receivers_per_sender: usize,
 
-    #[clap(long, default_value = "10000")]
-    pub num_messages: usize,
-
-    #[clap(long, default_value = "64")]
-    pub payload_size: usize,
-
-    #[clap(long, default_value = "ipc")]
-    pub transport: String,
-
-    #[clap(long)]
-    pub save_hists: bool,
-
-    #[clap(long, default_value = "results.csv")]
-    pub output: String,
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -63,20 +70,8 @@ struct DealerBenchmarkArgs {
     #[clap(long, default_value = "1")]
     pub num_pairs: usize,
 
-    #[clap(long, default_value = "10000")]
-    pub num_messages: usize,
-
-    #[clap(long, default_value = "64")]
-    pub payload_size: usize,
-
-    #[clap(long, default_value = "ipc")]
-    pub transport: String,
-
-    #[clap(long)]
-    pub save_hists: bool,
-
-    #[clap(long, default_value = "results.csv")]
-    pub output: String,
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -84,20 +79,8 @@ struct DealerRouterBenchmarkArgs {
     #[clap(long, default_value = "1")]
     pub num_dealers: usize,
 
-    #[clap(long, default_value = "10000")]
-    pub num_messages: usize,
-
-    #[clap(long, default_value = "64")]
-    pub payload_size: usize,
-
-    #[clap(long, default_value = "ipc")]
-    pub transport: String,
-
-    #[clap(long)]
-    pub save_hists: bool,
-
-    #[clap(long, default_value = "results.csv")]
-    pub output: String,
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -134,25 +117,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Command::PubsubBenchmark(a) => {
-            init_context(a.save_hists, a.output);
+            init_context(a.common.save_hists, a.common.output);
             let p = Pattern::PubSub {
                 num_senders: a.num_senders,
                 num_receivers_per_sender: a.num_receivers_per_sender,
             };
             let total = a.num_senders * (1 + a.num_receivers_per_sender);
-            run_bench_with_pattern(p, a.transport, a.payload_size, a.num_messages, total)?;
+            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total)?;
         }
         Command::DealerBenchmark(a) => {
-            init_context(a.save_hists, a.output);
+            init_context(a.common.save_hists, a.common.output);
             let p = Pattern::Dealer { num_pairs: a.num_pairs };
             let total = a.num_pairs * 2;
-            run_bench_with_pattern(p, a.transport, a.payload_size, a.num_messages, total)?;
+            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total)?;
         }
         Command::DealerRouterBenchmark(a) => {
-            init_context(a.save_hists, a.output);
+            init_context(a.common.save_hists, a.common.output);
             let p = Pattern::DealerRouter { num_dealers: a.num_dealers };
             let total = a.num_dealers * 2 + 1;
-            run_bench_with_pattern(p, a.transport, a.payload_size, a.num_messages, total)?;
+            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total)?;
         }
         Command::RunBenchmarks(args) => {
             init_context(args.save_hists, args.output.clone());
@@ -276,7 +259,6 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
         "DEALER-ROUTER Configuration: {} dealers (circular), {} messages (per dealer)",
         args.num_dealerrouter_dealers, args.num_messages
     );
-    println!("HWM internally = num_messages + headroom (no drops possible). No batch-sleep (lean, full-speed after handshake).");
     println!();
 
     let sections: &[(&str, Pattern)] = &[

@@ -1,46 +1,35 @@
-use csv;
 use hdrhistogram::Histogram;
 use hdrhistogram::serialization::Serializer;
 use serde::Serialize;
 use std::error::Error;
 use std::fs;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::Error as IoError;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinError;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
+/// First message of the handshake: subscriber/dealer is alive but not yet ready.
 pub const HELLO_MARKER: u64 = 0;
-
-pub fn is_hello_marker(buffer: &[u8]) -> bool {
-    if buffer.len() < 8 {
-        return false;
-    }
-    let val = u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-    val == HELLO_MARKER
-}
-
+/// Last handshake message: real (timestamped) traffic follows immediately after.
 pub const BEGIN_BENCHMARK_MARKER: u64 = u64::MAX;
 
-pub fn is_begin_marker(buffer: &[u8]) -> bool {
-    if buffer.len() < 8 {
-        return false;
-    }
-    let val = u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-    val == BEGIN_BENCHMARK_MARKER
+/// Read the leading little-endian u64 from a message. Every message's first 8
+/// bytes are either a marker or the send-time TSC; callers guarantee len >= 8.
+#[inline]
+pub fn read_leading_u64(buffer: &[u8]) -> u64 {
+    u64::from_le_bytes(buffer[..8].try_into().unwrap())
 }
 
-pub fn extract_timestamp(buffer: &[u8]) -> u64 {
-    u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ])
+pub fn is_hello_marker(buffer: &[u8]) -> bool {
+    buffer.len() >= 8 && read_leading_u64(buffer) == HELLO_MARKER
+}
+
+pub fn is_begin_marker(buffer: &[u8]) -> bool {
+    buffer.len() >= 8 && read_leading_u64(buffer) == BEGIN_BENCHMARK_MARKER
 }
 
 pub trait ZmqResultExt<T> {
@@ -49,29 +38,7 @@ pub trait ZmqResultExt<T> {
 
 impl<T> ZmqResultExt<T> for Result<T, zmq::Error> {
     fn box_err(self) -> Result<T, BoxError> {
-        self.map_err(|e| -> BoxError { Box::new(IoError::new(ErrorKind::Other, e.to_string())) })
-    }
-}
-
-pub trait HdrResultExt<T> {
-    fn box_err(self) -> Result<T, BoxError>;
-}
-
-impl<T> HdrResultExt<T> for Result<T, hdrhistogram::CreationError> {
-    fn box_err(self) -> Result<T, BoxError> {
-        self.map_err(|e| -> BoxError { Box::new(e) })
-    }
-}
-
-impl<T> HdrResultExt<T> for Result<T, hdrhistogram::RecordError> {
-    fn box_err(self) -> Result<T, BoxError> {
-        self.map_err(|e| -> BoxError { Box::new(e) })
-    }
-}
-
-impl<T> HdrResultExt<T> for Result<T, hdrhistogram::serialization::V2SerializeError> {
-    fn box_err(self) -> Result<T, BoxError> {
-        self.map_err(|e| -> BoxError { Box::new(e) })
+        self.map_err(|e| -> BoxError { Box::new(IoError::other(e.to_string())) })
     }
 }
 
@@ -84,16 +51,10 @@ impl<T> JoinResultExt<T> for Result<Result<T, BoxError>, JoinError> {
         match self {
             Ok(Ok(t)) => Ok(t),
             Ok(Err(e)) => Err(e),
-            Err(e) => Err(Box::new(IoError::new(
-                ErrorKind::Other,
-                format!("Task join error: {}", e),
-            ))),
+            Err(e) => Err(Box::new(IoError::other(format!("Task join error: {}", e)))),
         }
     }
 }
-
-use std::sync::atomic::AtomicUsize;
-use std::sync::OnceLock;
 
 /// Unified global static context for the entire program run.
 /// All program-wide configuration, computed values, and mutable runtime state
@@ -203,12 +164,10 @@ impl Context {
         self.next_cpu.fetch_add(1, Ordering::Relaxed) % self.total_cpus
     }
 
+    /// Track an endpoint so its backing file can be removed on early exit. Only
+    /// `ipc://` leaves a filesystem artifact; `tcp://` needs no cleanup.
     pub fn register_dirty_state(&self, addr: &str) {
         if addr.starts_with("ipc://") {
-            if let Ok(mut guard) = self.dirty_state.lock() {
-                guard.push(addr.to_string());
-            }
-        } else if addr.starts_with("tcp://") {
             if let Ok(mut guard) = self.dirty_state.lock() {
                 guard.push(addr.to_string());
             }
@@ -216,15 +175,12 @@ impl Context {
     }
 
     pub fn cleanup_dirty_state(&self) {
-        let mut items = Vec::new();
-        if let Ok(mut guard) = self.dirty_state.lock() {
-            items = std::mem::take(&mut *guard);
-        }
+        let items = match self.dirty_state.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => return,
+        };
         for addr in items {
-            if addr.starts_with("ipc://") {
-                let path = addr.trim_start_matches("ipc://");
-                let _ = std::fs::remove_file(path);
-            }
+            maybe_remove_ipc(&addr);
         }
     }
 }
@@ -237,7 +193,7 @@ pub fn save_histogram_hgrm(prefix: &str, hist: &Histogram<u64>) -> Result<(), Bo
     let filename = format!("{}.hgrm", prefix);
     let file = std::fs::File::create(&filename)?;
     let mut serializer = hdrhistogram::serialization::V2Serializer::new();
-    serializer.serialize(hist, &mut std::io::BufWriter::new(file)).box_err()?;
+    serializer.serialize(hist, &mut std::io::BufWriter::new(file))?;
     Ok(())
 }
 
@@ -293,6 +249,10 @@ pub fn log_affinity_info(label: &str) {
     }
 }
 
+/// Shared timestamps spanning the synchronization phase: the first HELLO sent by
+/// any sender and the last entry into the measured phase. Cloning shares the same
+/// atomics, so every sender updates the one instance the main task later prints.
+#[derive(Clone)]
 pub struct SyncPhase {
     pub first_hello_tsc: Arc<AtomicU64>,
     pub last_bench_start_tsc: Arc<AtomicU64>,
@@ -310,8 +270,7 @@ impl SyncPhase {
         let first = self.first_hello_tsc.load(Ordering::Relaxed);
         let last = self.last_bench_start_tsc.load(Ordering::Relaxed);
         if last > first && first != u64::MAX {
-            let delta_tsc = last - first;
-            let ns = (delta_tsc as f64 / tsc_per_ns) as u64;
+            let ns = ((last - first) as f64 / tsc_per_ns) as u64;
             println!(
                 "Synchronization phase duration: {} ns ({:.3} ms)",
                 ns,
@@ -319,23 +278,18 @@ impl SyncPhase {
             );
         }
     }
-
 }
 
+/// Earliest moment any sender began the handshake (min across senders).
 #[inline]
-pub fn record_first_hello(first: Option<&Arc<AtomicU64>>) {
-    if let Some(f) = first {
-        let t = unsafe { std::arch::x86_64::_rdtsc() };
-        f.fetch_min(t, Ordering::Relaxed);
-    }
+pub fn record_first_hello(first: &AtomicU64) {
+    first.fetch_min(unsafe { std::arch::x86_64::_rdtsc() }, Ordering::Relaxed);
 }
 
+/// Latest moment any sender entered the measured phase (max across senders).
 #[inline]
-pub fn record_bench_start(last: Option<&Arc<AtomicU64>>) {
-    if let Some(l) = last {
-        let t = unsafe { std::arch::x86_64::_rdtsc() };
-        l.fetch_max(t, Ordering::Relaxed);
-    }
+pub fn record_bench_start(last: &AtomicU64) {
+    last.fetch_max(unsafe { std::arch::x86_64::_rdtsc() }, Ordering::Relaxed);
 }
 
 pub fn collect_and_append_result(
@@ -463,9 +417,9 @@ pub fn finalize_measurements(
         .map(|&c| (c as f64 / tsc_per_ns) as u64)
         .collect();
 
-    let mut histogram = Histogram::<u64>::new(3).box_err()?;
+    let mut histogram = Histogram::<u64>::new(3)?;
     for &latency_ns in &latencies_ns {
-        histogram.record(latency_ns).box_err()?;
+        histogram.record(latency_ns)?;
     }
 
     maybe_save_individual_hist(pattern, transport, payload_size, &histogram, &latencies_ns, &recv_cpus);
@@ -512,15 +466,13 @@ pub fn cleanup_dirty_state() {
     context().cleanup_dirty_state();
 }
 
-/// Hot loop rcvtimeo computed from data volume the suite pushes.
-/// X is estimated push time for (N msgs * (payload + overhead)); timeout = X*2.
-/// Suite completes very fast on local ZMQ, so this yields low-second timeouts
-/// (much tighter than any fixed 30s/60s). Only non-standard policy is the *2
-/// safety factor + volume basis (names alone don't communicate the calc).
+/// Per-receive timeout for the measured phase, scaled to the data volume:
+/// estimate the time to push all messages (a fixed per-message cost plus a
+/// per-byte term), double it for headroom, and floor at 1s so a healthy
+/// localhost run never times out on scheduling jitter. A stalled stream then
+/// fails within a small multiple of this rather than hanging.
 pub fn compute_hot_loop_timeout(num_messages: usize, payload_size: usize) -> Duration {
-    // Per-iter cost model (base + payload) * N gives X; *2 per spec.
-    // Floor at 1s so normal localhost runs (even with jitter/pinning) don't spuriously timeout.
-    let per_iter_ns = 5_000u64 + (payload_size as u64 * 20);
-    let x_ns = (num_messages as u64).saturating_mul(per_iter_ns);
-    Duration::from_nanos(x_ns.saturating_mul(2).max(1_000_000_000))
+    let per_msg_ns = 5_000u64 + payload_size as u64 * 20;
+    let estimate_ns = (num_messages as u64).saturating_mul(per_msg_ns);
+    Duration::from_nanos(estimate_ns.saturating_mul(2).max(1_000_000_000))
 }
