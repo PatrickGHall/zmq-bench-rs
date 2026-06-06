@@ -70,12 +70,6 @@ struct PubsubBenchmarkArgs {
 
     #[clap(long, default_value = "ipc")]
     pub transport: String,
-
-    #[clap(long, default_value = "1000")]
-    pub hwm: i32,
-
-    #[clap(long, default_value = "10")]
-    pub batch_sleep_ms: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -106,12 +100,6 @@ struct DealerRouterBenchmarkArgs {
 
     #[clap(long, default_value = "ipc")]
     pub transport: String,
-
-    #[clap(long, default_value = "1000")]
-    pub hwm: i32,
-
-    #[clap(long, default_value = "10")]
-    pub batch_sleep_ms: u64,
 }
 
 /// Full suite runner. Args and defaults match the original run_benchmarks.sh script.
@@ -125,12 +113,6 @@ struct RunBenchmarksArgs {
 
     #[clap(long, default_value = "10000")]
     pub num_messages: usize,
-
-    #[clap(long, default_value = "1000")]
-    pub hwm: i32,
-
-    #[clap(long, default_value = "500")]
-    pub batch_sleep_ms: u64,
 
     #[clap(long, default_value = "1")]
     pub num_dealer_pairs: usize,
@@ -149,40 +131,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::PubsubBenchmark(args) => {
             let total_tasks = args.num_senders * (1 + args.num_receivers_per_sender);
             let worker_threads = total_tasks.min(num_cpus::get());
-            let rt = Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .build()?;
+            let rt = build_bench_runtime(worker_threads)?;
             rt.block_on(run_pubsub_benchmark(args))?;
         }
         Command::DealerBenchmark(args) => {
             let total_tasks = args.num_pairs * 2;
             let worker_threads = total_tasks.min(num_cpus::get());
-            let rt = Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .build()?;
+            let rt = build_bench_runtime(worker_threads)?;
             rt.block_on(run_dealer_benchmark(args))?;
         }
         Command::DealerRouterBenchmark(args) => {
             let total_tasks = args.num_dealers * 2 + 1;
             let worker_threads = total_tasks.min(num_cpus::get());
-            let rt = Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .build()?;
+            let rt = build_bench_runtime(worker_threads)?;
             rt.block_on(run_dealerrouter_benchmark(args))?;
         }
         Command::RunBenchmarks(args) => {
-            let rt = Builder::new_multi_thread()
-                .worker_threads(num_cpus::get())
-                .enable_all()
-                .build()?;
+            let rt = build_bench_runtime(num_cpus::get())?;
             rt.block_on(run_benchmarks(args))?;
         }
     }
 
     Ok(())
+}
+
+/// Build a multi-thread runtime, optionally with affinity pinning on the
+/// worker threads (when ZMQ_BENCH_AFFINITY=1). The spawn_blocking tasks
+/// (where the real measurement work happens) are also pinned via
+/// maybe_pin_for_bench() calls inside them.
+fn build_bench_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime, Box<dyn Error>> {
+    let mut builder = Builder::new_multi_thread();
+    builder
+        .worker_threads(worker_threads)
+        .enable_all();
+
+    // Always pin worker threads by default for statistical stability.
+    // This addresses per-peer imbalance and reduces migration noise/outliers.
+    // Disable with ZMQ_BENCH_NO_AFFINITY=1.
+    if std::env::var("ZMQ_BENCH_NO_AFFINITY").is_err() {
+        builder.on_thread_start(|| {
+            // Pin the async worker threads round-robin as they are created by the runtime.
+            let cpu = crate::zmq_helpers::assign_next_cpu();
+            let _ = crate::zmq_helpers::pin_current_thread_to_cpu(cpu);
+        });
+    }
+
+    builder.build().map_err(Into::into)
 }
 
 async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn Error>> {
@@ -192,6 +186,9 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
     );
 
     println!("Calibrating TSC...");
+    if std::env::var("ZMQ_BENCH_SAVE_HISTS").is_ok() {
+        crate::zmq_helpers::log_affinity_info("main_calibrate_start");
+    }
     let tsc_per_ns = calibrate_tsc();
     println!(
         "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
@@ -214,30 +211,39 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
         };
 
         let mut hello_acks = Vec::new();
+        let mut begin_acks = Vec::new();
         for _receiver_id in 0..args.num_receivers_per_sender {
             let (hello_ack_tx, hello_ack_rx) = oneshot::channel();
+            let (begin_ack_tx, begin_ack_rx) = oneshot::channel();
             hello_acks.push(hello_ack_rx);
+            begin_acks.push(begin_ack_rx);
 
             let sub_args = subscriber::Args {
                 addresses: vec![address.clone()],
                 num_messages: args.num_messages,
                 payload_size: args.payload_size,
-                hwm: args.hwm,
             };
 
             let task = tokio::spawn(async move {
-                subscriber::run_async(sub_args, tsc_per_ns, Some(hello_ack_tx)).await
+                subscriber::run_async(sub_args, tsc_per_ns, Some(hello_ack_tx), Some(begin_ack_tx)).await
             });
             subscriber_tasks.push(task);
         }
 
-        // Hello-phase coordinator: wait until all subscribers for this publisher have
-        // received (and acked) at least one hello on the data path. Then tell the
-        // publisher (via the atomic) to stop sending hellos and send real benchmark data.
-        // Use a timeout so a missing hello from one sub doesn't hang the entire run
-        // (liveness); force the phase on timeout and proceed (some subs may see drops).
+        // Hello-phase + BEGIN handshake coordinator:
+        // 1. Wait for all subs to have received (and acked) at least one hello on the data path.
+        //    Then set bench_phase so publisher stops hellos and sends the BEGIN marker.
+        // 2. Wait for all subs to have received and acked the BEGIN (subs send begin_ack
+        //    after consuming the marker and entering clean collection).
+        // 3. Signal the publisher (via reals_start_rx) that all receivers are ready
+        //    before it starts sending benchmark messages.
+        // This makes sync a proper barrier-style handshake for BEGIN, consistent with
+        // the goal across routes. No settle sleep required; HWM should match num msgs
+        // to avoid drops on high rate.
+        // Timeout is best-effort (liveness); warnings/partials may still occur for missing subs.
         let bench_phase = Arc::new(AtomicBool::new(false));
         let bench_phase_for_coordinator = bench_phase.clone();
+        let (reals_start_tx, reals_start_rx) = oneshot::channel();
         tokio::spawn(async move {
             let sync_timeout = std::time::Duration::from_secs(30);
             let _ = tokio::time::timeout(sync_timeout, async {
@@ -245,27 +251,32 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
                     let _ = rx.await;
                 }
             }).await;
-            // On timeout we still force the phase (best effort); the warning is emitted
-            // by the publisher side or via partial collection results.
             bench_phase_for_coordinator.store(true, Ordering::Release);
+
+            let _ = tokio::time::timeout(sync_timeout, async {
+                for rx in begin_acks {
+                    let _ = rx.await;
+                }
+            }).await;
+            let _ = reals_start_tx.send(());
         });
 
         let pub_args = publisher::Args {
             payload_size: args.payload_size,
             num_messages: args.num_messages,
             address,
-            hwm: args.hwm,
-            batch_sleep_ms: args.batch_sleep_ms,
         };
 
         let first_clone = first_hello_tsc.clone();
         let last_clone = last_bench_start_tsc.clone();
+        let reals_rx = reals_start_rx;
         let task = tokio::spawn(async move {
             publisher::run_async(
                 pub_args,
                 Some(bench_phase),
                 Some(first_clone),
                 Some(last_clone),
+                Some(reals_rx),
             )
             .await
         });
@@ -278,6 +289,20 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
             Ok(Ok(h)) => histograms.push(h),
             Ok(Err(e)) => return Err(format!("Subscriber task failed: {}", e).into()),
             Err(e) => return Err(format!("Subscriber task join error: {}", e).into()),
+        }
+    }
+
+    // Surface per-receiver stats for multi-receiver pubsub (N>1). Experiments showed
+    // consistent 30%+ p50 differences between subs even on same core or with pinning.
+    // This is inherent to fan-out; pooled total is still computed, but users see the spread.
+    if histograms.len() > 1 {
+        for (i, h) in histograms.iter().enumerate() {
+            println!(
+                "  pubsub-receiver[{}] p50={} p99={}",
+                i,
+                h.value_at_percentile(50.0),
+                h.value_at_percentile(99.0)
+            );
         }
     }
 
@@ -314,6 +339,7 @@ async fn run_pubsub_benchmark(args: PubsubBenchmarkArgs) -> Result<(), Box<dyn E
         &total_histogram,
     )?;
 
+
     println!("Benchmark complete!");
     Ok(())
 }
@@ -322,6 +348,9 @@ async fn run_dealer_benchmark(args: DealerBenchmarkArgs) -> Result<(), Box<dyn E
     println!("Starting dealer benchmark with {} pairs", args.num_pairs);
 
     println!("Calibrating TSC...");
+    if std::env::var("ZMQ_BENCH_SAVE_HISTS").is_ok() {
+        crate::zmq_helpers::log_affinity_info("main_calibrate_start");
+    }
     let tsc_per_ns = calibrate_tsc();
     println!(
         "TSC calibration: {:.3} GHz ({:.6} cycles/ns)",
@@ -464,7 +493,6 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         bind_address: router_address.clone(),
         num_dealers: args.num_dealers,
         num_messages_per_dealer: args.num_messages,
-        hwm: args.hwm,
     };
 
     let end_barrier_clone = end_barrier.clone();
@@ -484,8 +512,6 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         let dealer_args = dealerrouter_dealer::Args {
             payload_size: args.payload_size,
             num_messages: args.num_messages,
-            hwm: args.hwm,
-            batch_sleep_ms: args.batch_sleep_ms,
             router_address: router_address.clone(),
             dealer_id,
             num_dealers: args.num_dealers,
@@ -534,6 +560,19 @@ async fn run_dealerrouter_benchmark(args: DealerRouterBenchmarkArgs) -> Result<(
         }
     }
 
+    // Surface per-dealer stats for N>1 (experiments showed some imbalance in the ring
+    // even with pinning; helps users understand pooled result).
+    if histograms.len() > 1 {
+        for (i, h) in histograms.iter().enumerate() {
+            println!(
+                "  dealerrouter-dealer[{}] p50={} p99={}",
+                i,
+                h.value_at_percentile(50.0),
+                h.value_at_percentile(99.0)
+            );
+        }
+    }
+
     // Print synchronization phase duration for dealerrouter.
     let first = first_hello_tsc.load(Ordering::Relaxed);
     let last = last_bench_start_tsc.load(Ordering::Relaxed);
@@ -574,7 +613,9 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
     if let Ok(entries) = std::fs::read_dir(".") {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "hgrm") {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if ext == "hgrm" || ext == "rawlat.txt" || name.starts_with("indiv_") {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -590,10 +631,10 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
         args.num_dealer_pairs, args.num_messages
     );
     println!(
-        "DEALER-ROUTER Configuration: {} dealers (circular), {} messages (per dealer), High Water Mark: {}",
-        args.num_dealerrouter_dealers, args.num_messages, args.hwm
+        "DEALER-ROUTER Configuration: {} dealers (circular), {} messages (per dealer)",
+        args.num_dealerrouter_dealers, args.num_messages
     );
-    println!("Batch sleep: {}ms (PUB/SUB only)", args.batch_sleep_ms);
+    println!("HWM internally = num_messages + headroom (no drops possible). No batch-sleep (lean, full-speed after handshake).");
     println!("");
 
     println!("=== PUB/SUB Benchmarks ===");
@@ -606,8 +647,6 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
             num_messages: args.num_messages,
             payload_size: *size,
             transport: "ipc".to_string(),
-            hwm: args.hwm,
-            batch_sleep_ms: args.batch_sleep_ms,
         };
         run_pubsub_benchmark(bargs).await?;
 
@@ -628,8 +667,6 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
             num_messages: args.num_messages,
             payload_size: *size,
             transport: "tcp".to_string(),
-            hwm: args.hwm,
-            batch_sleep_ms: args.batch_sleep_ms,
         };
         run_pubsub_benchmark(bargs).await?;
 
@@ -681,8 +718,6 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
             num_messages: args.num_messages,
             payload_size: *size,
             transport: "ipc".to_string(),
-            hwm: args.hwm,
-            batch_sleep_ms: args.batch_sleep_ms,
         };
         run_dealerrouter_benchmark(bargs).await?;
 
@@ -700,8 +735,6 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
             num_messages: args.num_messages,
             payload_size: *size,
             transport: "tcp".to_string(),
-            hwm: args.hwm,
-            batch_sleep_ms: args.batch_sleep_ms,
         };
         run_dealerrouter_benchmark(bargs).await?;
 

@@ -1,9 +1,10 @@
-use crate::zmq_helpers::{BoxError, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{maybe_pin_for_bench, BoxError, JoinResultExt, ZmqResultExt};
 use std::arch::x86_64::_rdtsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::runtime::Handle;
-use tokio::time::{sleep, Duration};
+use tokio::sync::oneshot;
+use tokio::time::Duration;
 use zmq::Context;
 
 #[derive(Debug, Clone)]
@@ -11,8 +12,6 @@ pub struct Args {
     pub payload_size: usize,
     pub num_messages: usize,
     pub address: String,
-    pub hwm: i32,
-    pub batch_sleep_ms: u64,
 }
 
 pub async fn run_async(
@@ -20,18 +19,22 @@ pub async fn run_async(
     bench_phase: Option<Arc<AtomicBool>>,
     first_hello_tsc: Option<Arc<AtomicU64>>,
     last_bench_start_tsc: Option<Arc<AtomicU64>>,
+    reals_start_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || {
+        maybe_pin_for_bench();
         let context = Context::new();
         let publisher = context.socket(zmq::PUB).box_err()?;
-        publisher.set_sndhwm(args.hwm).box_err()?;
+        // HWM = num + headroom so drops impossible.
+        let hwm = (args.num_messages + 1000) as i32;
+        publisher.set_sndhwm(hwm).box_err()?;
 
         publisher.bind(&args.address).box_err()?;
 
         let handle = Handle::current();
 
         let mut msg = vec![0u8; args.payload_size];
-        let batch_size = args.hwm as usize;
+        // No batch pacing. HWM = num + headroom; full speed after handshake.
 
         // Synchronization phase: send hello messages (first 8 bytes = 0) so that subscribers
         // can prove they are receiving on the data path and ack to the harness.
@@ -71,17 +74,22 @@ pub async fn run_async(
             last.fetch_max(start_tsc, Ordering::Relaxed);
         }
 
+        // Wait for all subscribers to have received and ACKed the BEGIN marker
+        // (signaled via the reals_start channel after the coordinator waits for
+        // all begin_acks) before sending any real benchmark messages.
+        // This completes the synchronization handshake on the receiver side.
+        // No settle sleep is needed.
+        if let Some(rx) = reals_start_rx {
+            let _ = handle.block_on(async { rx.await });
+        }
+
         // Real benchmark phase. Hot path (per-message) has no phase-related conditionals,
         // no extra TSC recording for duration, only ZMQ send + batch sleep if configured.
-        for i in 0..args.num_messages {
+        for _i in 0..args.num_messages {
             let tsc = unsafe { _rdtsc() };
             msg[0..8].copy_from_slice(&tsc.to_le_bytes());
 
             publisher.send(&msg, 0).box_err()?;
-
-            if args.batch_sleep_ms > 0 && (i + 1) % batch_size == 0 {
-                handle.block_on(sleep(Duration::from_millis(args.batch_sleep_ms)));
-            }
         }
 
         if args.address.starts_with("ipc://") {

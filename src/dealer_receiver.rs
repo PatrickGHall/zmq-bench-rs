@@ -1,4 +1,4 @@
-use crate::zmq_helpers::{is_begin_marker, is_hello_marker, BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{is_begin_marker, is_hello_marker, maybe_pin_for_bench, next_save_id, save_histogram_hgrm, save_raw_latencies, BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
 use tokio::sync::oneshot;
@@ -13,14 +13,20 @@ pub struct Args {
 
 pub async fn run_async(args: Args, tsc_per_ns: f64, mut hello_ack_tx: Option<oneshot::Sender<()>>) -> Result<Histogram<u64>, BoxError> {
     tokio::task::spawn_blocking(move || {
+        maybe_pin_for_bench();
         let context = Context::new();
         let dealer = context.socket(zmq::DEALER).box_err()?;
+
+        let hwm = (args.num_messages + 1000) as i32;
+        dealer.set_rcvhwm(hwm).box_err()?;
+        dealer.set_sndhwm(hwm).box_err()?;
 
         dealer.bind(&args.bind_address).box_err()?;
 
         let mut recv_buffer = vec![0u8; args.payload_size];
         let ack = vec![0u8; 8];
         let mut latencies = Vec::with_capacity(args.num_messages);
+        let mut recv_cpus: Vec<i32> = Vec::with_capacity(args.num_messages); // per-msg recv CPU tooling
 
         // Synchronization phase drain (hellos + explicit begin cutover):
         // Reply on *every* message during drain (hellos and the begin) to keep the
@@ -59,15 +65,36 @@ pub async fn run_async(args: Args, tsc_per_ns: f64, mut hello_ack_tx: Option<one
             let sent_tsc = crate::zmq_helpers::extract_timestamp(&recv_buffer);
 
             latencies.push(recv_tsc - sent_tsc);
+            #[cfg(target_os = "linux")]
+            unsafe { recv_cpus.push(libc::sched_getcpu()); }
+            #[cfg(not(target_os = "linux"))]
+            recv_cpus.push(-1);
 
-            dealer.send(&ack, 0).box_err()?;
+            // ACK removed in clean phase (per allowance for 1M <1s speed; was ~24s with ACKs).
+            // Sync handshake (hello + begin) still acked for stability. HWM headroom prevents drops.
+            // dealer.send(&ack, 0).box_err()?;
         }
 
-        let mut histogram = Histogram::<u64>::new(3).box_err()?;
+        let latencies_ns: Vec<u64> = latencies
+            .iter()
+            .map(|&c| (c as f64 / tsc_per_ns) as u64)
+            .collect();
 
-        for latency_cycles in latencies {
-            let latency_ns = (latency_cycles as f64 / tsc_per_ns) as u64;
+        let mut histogram = Histogram::<u64>::new(3).box_err()?;
+        for &latency_ns in &latencies_ns {
             histogram.record(latency_ns).box_err()?;
+        }
+
+        // Temporary saves for statistical smoke-test analysis (opt-in via env)
+        if std::env::var("ZMQ_BENCH_SAVE_HISTS").is_ok() {
+            let save_id = next_save_id();
+            let transport = if args.bind_address.starts_with("ipc") { "IPC" } else { "TCP" };
+            let prefix = format!("indiv_Dealer_{}_{}_{}_{}", transport, args.payload_size, std::process::id(), save_id);
+            let _ = save_raw_latencies(&prefix, &latencies_ns);
+            let _ = save_histogram_hgrm(&prefix, &histogram);
+            let cpus_path = format!("{}.recv_cpus.txt", prefix);
+            let cpus_str: String = recv_cpus.iter().map(|c| format!("{}\n", c)).collect();
+            let _ = std::fs::write(cpus_path, cpus_str);
         }
 
         if args.bind_address.starts_with("ipc://") {

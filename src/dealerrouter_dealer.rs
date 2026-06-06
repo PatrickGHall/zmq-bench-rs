@@ -1,4 +1,4 @@
-use crate::zmq_helpers::{is_begin_marker, is_hello_marker, BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{is_begin_marker, is_hello_marker, maybe_pin_for_bench, next_save_id, save_histogram_hgrm, save_raw_latencies, BoxError, HdrResultExt, JoinResultExt, ZmqResultExt};
 use hdrhistogram::Histogram;
 use std::arch::x86_64::_rdtsc;
 use std::sync::Arc;
@@ -6,15 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, Barrier};
-use tokio::time::sleep;
+
 use zmq::Context;
 
 #[derive(Debug, Clone)]
 pub struct Args {
     pub payload_size: usize,
     pub num_messages: usize,
-    pub hwm: i32,
-    pub batch_sleep_ms: u64,
     pub router_address: String,
     pub dealer_id: usize,
     pub num_dealers: usize,
@@ -37,18 +35,21 @@ pub async fn run_async(
     let hello_ack_tx = Some(hello_ack_tx);
     let recv_end_barrier = end_barrier.clone();
     let recv_handle = tokio::task::spawn_blocking(move || -> Result<Histogram<u64>, BoxError> {
+        maybe_pin_for_bench();
         let context = Context::new();
         let receiver = context.socket(zmq::DEALER).box_err()?;
 
         let identity = format!("dealer_{}", receiver_id);
         receiver.set_identity(identity.as_bytes()).box_err()?;
-        receiver.set_rcvhwm(args.hwm).box_err()?;
+        let hwm = (recv_args.num_messages + 1000) as i32;
+        receiver.set_rcvhwm(hwm).box_err()?;
 
         receiver.connect(&recv_args.router_address).box_err()?;
 
         let mut hello_ack_tx = hello_ack_tx; // ensure mutable binding inside closure
         let mut recv_buffer = vec![0u8; recv_args.payload_size];
         let mut latencies = Vec::with_capacity(recv_args.num_messages);
+        let mut recv_cpus: Vec<i32> = Vec::with_capacity(recv_args.num_messages); // per-msg recv CPU
 
         // Synchronization phase drain (hellos + explicit begin cutover):
         // Eat hellos (notify harness once on first). Consume the begin marker as
@@ -83,16 +84,35 @@ pub async fn run_async(
             let sent_tsc = crate::zmq_helpers::extract_timestamp(&recv_buffer);
 
             latencies.push(recv_tsc - sent_tsc);
+            #[cfg(target_os = "linux")]
+            unsafe { recv_cpus.push(libc::sched_getcpu()); }
+            #[cfg(not(target_os = "linux"))]
+            recv_cpus.push(-1);
         }
 
         let handle = Handle::current();
         handle.block_on(recv_end_barrier.wait());
 
-        let mut histogram = Histogram::<u64>::new(3).box_err()?;
+        let latencies_ns: Vec<u64> = latencies
+            .iter()
+            .map(|&c| (c as f64 / tsc_per_ns) as u64)
+            .collect();
 
-        for latency_cycles in latencies {
-            let latency_ns = (latency_cycles as f64 / tsc_per_ns) as u64;
+        let mut histogram = Histogram::<u64>::new(3).box_err()?;
+        for &latency_ns in &latencies_ns {
             histogram.record(latency_ns).box_err()?;
+        }
+
+        // Temporary saves for statistical smoke-test analysis (opt-in via env)
+        if std::env::var("ZMQ_BENCH_SAVE_HISTS").is_ok() {
+            let save_id = next_save_id();
+            let transport = if recv_args.router_address.starts_with("ipc") { "IPC" } else { "TCP" };
+            let prefix = format!("indiv_DealerRouter_{}_{}_{}_{}", transport, recv_args.payload_size, std::process::id(), save_id);
+            let _ = save_raw_latencies(&prefix, &latencies_ns);
+            let _ = save_histogram_hgrm(&prefix, &histogram);
+            let cpus_path = format!("{}.recv_cpus.txt", prefix);
+            let cpus_str: String = recv_cpus.iter().map(|c| format!("{}\n", c)).collect();
+            let _ = std::fs::write(cpus_path, cpus_str);
         }
 
         Ok(histogram)
@@ -100,12 +120,14 @@ pub async fn run_async(
 
     let send_args = args.clone();
     let send_handle = tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+        maybe_pin_for_bench();
         let context = Context::new();
         let sender = context.socket(zmq::DEALER).box_err()?;
 
         let identity = format!("dealer_{}", sender_id);
         sender.set_identity(identity.as_bytes()).box_err()?;
-        sender.set_sndhwm(args.hwm).box_err()?;
+        let hwm = (send_args.num_messages + 1000) as i32;
+        sender.set_sndhwm(hwm).box_err()?;
 
         let router_addr = send_args.router_address.clone();
         sender.connect(&router_addr).box_err()?;
@@ -113,7 +135,8 @@ pub async fn run_async(
         let dest_id = format!("dealer_{}", target_receiver_id).into_bytes();
         let mut send_buffer = vec![0u8; send_args.payload_size];
 
-        let batch_size = args.hwm as usize;
+        // No batch pacing sleeps. HWM set to num + headroom; full speed.
+
 
         // Synchronization phase: keep sending hello messages (timestamp field = 0) until the
         // harness signals (via the atomic) that all relevant receivers have seen
@@ -154,18 +177,19 @@ pub async fn run_async(
             last.fetch_max(start_tsc, Ordering::Relaxed);
         }
 
+        // No settle sleep after BEGIN (see pubsub BEGIN ACK handshake and worktree
+        // experiments): the synchronization phase + begin acks (where implemented)
+        // ensure receivers are in clean phase. batch_sleep controls pacing for the
+        // measurement. Settle removed per request (1ms was always chosen anyway).
+
+
         // Real benchmark phase. Hot path has no phase conditionals or extra recording.
-        for i in 0..send_args.num_messages {
+        for _i in 0..send_args.num_messages {
             let send_tsc = unsafe { _rdtsc() };
             send_buffer[0..8].copy_from_slice(&send_tsc.to_le_bytes());
 
             sender.send(&dest_id, zmq::SNDMORE).box_err()?;
             sender.send(&send_buffer, 0).box_err()?;
-
-            if send_args.batch_sleep_ms > 0 && (i + 1) % batch_size == 0 {
-                let handle = Handle::current();
-                handle.block_on(sleep(Duration::from_millis(send_args.batch_sleep_ms)));
-            }
         }
 
         Ok(())

@@ -935,6 +935,7 @@ dependencies = [
  "clap",
  "csv",
  "hdrhistogram",
+ "libc",
  "num_cpus",
  "serde",
  "tokio",

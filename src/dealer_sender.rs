@@ -1,4 +1,4 @@
-use crate::zmq_helpers::{BoxError, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{maybe_pin_for_bench, BoxError, JoinResultExt, ZmqResultExt};
 use std::arch::x86_64::_rdtsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,8 +18,13 @@ pub async fn run_async(
     last_bench_start_tsc: Option<Arc<AtomicU64>>,
 ) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || {
+        maybe_pin_for_bench();
         let context = Context::new();
         let dealer = context.socket(zmq::DEALER).box_err()?;
+
+        let hwm = (args.num_messages + 1000) as i32;
+        dealer.set_sndhwm(hwm).box_err()?;
+        dealer.set_rcvhwm(hwm).box_err()?;
 
         dealer.connect(&args.receiver_address).box_err()?;
 
@@ -72,7 +77,8 @@ pub async fn run_async(
             send_buffer[0..8].copy_from_slice(&send_tsc.to_le_bytes());
 
             dealer.send(&send_buffer, 0).box_err()?;
-            dealer.recv_into(&mut ack_buffer, 0).box_err()?;
+            // ACK removed in clean (speed); only sync phase.
+            // dealer.recv_into(&mut ack_buffer, 0).box_err()?;
         }
 
         Ok(())

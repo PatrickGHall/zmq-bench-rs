@@ -1,4 +1,4 @@
-use crate::zmq_helpers::{is_begin_marker, is_hello_marker, BoxError, JoinResultExt, ZmqResultExt};
+use crate::zmq_helpers::{is_begin_marker, is_hello_marker, maybe_pin_for_bench, BoxError, JoinResultExt, ZmqResultExt};
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use zmq::Context;
@@ -8,16 +8,17 @@ pub struct Args {
     pub bind_address: String,
     pub num_dealers: usize,
     pub num_messages_per_dealer: usize,
-    pub hwm: i32,
 }
 
 pub async fn run_async(args: Args, end_barrier: Arc<Barrier>) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+        maybe_pin_for_bench();
         let context = Context::new();
         let router = context.socket(zmq::ROUTER).box_err()?;
 
-        router.set_sndhwm(args.hwm).box_err()?;
-        router.set_rcvhwm(args.hwm).box_err()?;
+        let total_msgs = (args.num_dealers * args.num_messages_per_dealer + 1000) as i32;
+        router.set_sndhwm(total_msgs).box_err()?;
+        router.set_rcvhwm(total_msgs).box_err()?;
 
         router.bind(&args.bind_address).box_err()?;
 

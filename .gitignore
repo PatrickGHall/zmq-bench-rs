@@ -1,1 +1,6 @@
 /target
+indiv_*
+analysis_hists/
+*.rawlat.txt
+*.hgrm
+rawlat.txt
