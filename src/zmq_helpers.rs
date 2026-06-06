@@ -119,20 +119,22 @@ impl Context {
                 log_affinity_info("main_calibrate_start");
             }
 
-            const CALIBRATION_SAMPLES: usize = 10;
+            // 5 x 2ms = 10ms total. A 2ms window still spans ~8M TSC ticks, so
+            // the ticks/ns ratio is precise to well under 0.1%; taking the median
+            // rejects the occasional sample perturbed by a scheduling hiccup.
+            const CALIBRATION_SAMPLES: usize = 5;
+            const CALIBRATION_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
             let mut tsc_per_ns_samples = Vec::with_capacity(CALIBRATION_SAMPLES);
 
             for _ in 0..CALIBRATION_SAMPLES {
+                let time_start = std::time::Instant::now();
                 let tsc_start = unsafe { std::arch::x86_64::_rdtsc() };
-                let time_start = std::time::SystemTime::now();
 
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(CALIBRATION_SLEEP);
                 let tsc_end = unsafe { std::arch::x86_64::_rdtsc() };
-                let time_end = std::time::SystemTime::now();
+                let elapsed_ns = time_start.elapsed().as_nanos() as u64;
 
-                let elapsed_ns = time_end.duration_since(time_start).unwrap().as_nanos() as u64;
-                let elapsed_tsc = tsc_end - tsc_start;
-                let tsc_per_ns = elapsed_tsc as f64 / elapsed_ns as f64;
+                let tsc_per_ns = (tsc_end - tsc_start) as f64 / elapsed_ns as f64;
                 tsc_per_ns_samples.push(tsc_per_ns);
             }
 
@@ -297,13 +299,21 @@ pub fn collect_and_append_result(
     transport: &str,
     payload_size_bytes: usize,
     histograms: Vec<Histogram<u64>>,
+    throughput: Vec<ThroughputSample>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut total = Histogram::<u64>::new(3)?;
     for h in &histograms {
         total.add(h)?;
     }
 
-    append_benchmark_result(pattern, transport, payload_size_bytes, &total)
+    // Receivers run concurrently, so aggregate system throughput is the total
+    // messages drained over the longest receive span (the others overlap it).
+    let received: usize = throughput.iter().map(|t| t.received).sum();
+    let span_ns = throughput.iter().map(|t| t.span_ns).max().unwrap_or(0);
+    let msgs_per_sec = if span_ns > 0 { received as f64 * 1e9 / span_ns as f64 } else { 0.0 };
+    let mb_per_sec = msgs_per_sec * payload_size_bytes as f64 / 1e6;
+
+    append_benchmark_result(pattern, transport, payload_size_bytes, &total, msgs_per_sec, mb_per_sec)
 }
 
 pub fn print_per_item_stats(label: &str, histograms: &[Histogram<u64>]) {
@@ -355,6 +365,8 @@ struct BenchmarkResult {
     median_latency_ns: u64,
     p99_latency_ns: u64,
     max_latency_ns: u64,
+    msgs_per_sec: u64,
+    mb_per_sec: f64,
 }
 
 pub fn append_benchmark_result(
@@ -362,6 +374,8 @@ pub fn append_benchmark_result(
     transport: &str,
     payload_size_bytes: usize,
     histogram: &Histogram<u64>,
+    msgs_per_sec: f64,
+    mb_per_sec: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result = BenchmarkResult {
         pattern: pattern.to_string(),
@@ -371,6 +385,8 @@ pub fn append_benchmark_result(
         median_latency_ns: histogram.value_at_percentile(50.0),
         p99_latency_ns: histogram.value_at_percentile(99.0),
         max_latency_ns: histogram.max(),
+        msgs_per_sec: msgs_per_sec as u64,
+        mb_per_sec: (mb_per_sec * 100.0).round() / 100.0,
     };
 
     let csv_path = &context().output;
@@ -394,6 +410,7 @@ pub fn append_benchmark_result(
         histogram.value_at_percentile(99.9),
         histogram.max()
     );
+    println!("  throughput: {:.0} msg/s ({:.1} MB/s)", msgs_per_sec, mb_per_sec);
 
     Ok(())
 }
@@ -403,13 +420,22 @@ pub fn hwm(n: usize) -> i32 {
     (n as i32) + 1000
 }
 
+/// End-to-end receive throughput for one measurement stream: how many messages
+/// were drained and the wall-clock span from the first to the last received.
+#[derive(Clone, Copy)]
+pub struct ThroughputSample {
+    pub received: usize,
+    pub span_ns: u64,
+}
+
 pub fn finalize_measurements(
     latencies: Vec<u64>,
     recv_cpus: Vec<i32>,
+    recv_span_tsc: u64,
     pattern: &str,
     transport: &str,
     payload_size: usize,
-) -> Result<(Histogram<u64>, usize), BoxError> {
+) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     let received = latencies.len();
     let tsc_per_ns = get_tsc_per_ns();
     let latencies_ns: Vec<u64> = latencies
@@ -424,7 +450,8 @@ pub fn finalize_measurements(
 
     maybe_save_individual_hist(pattern, transport, payload_size, &histogram, &latencies_ns, &recv_cpus);
 
-    Ok((histogram, received))
+    let span_ns = (recv_span_tsc as f64 / tsc_per_ns) as u64;
+    Ok((histogram, ThroughputSample { received, span_ns }))
 }
 
 #[inline]

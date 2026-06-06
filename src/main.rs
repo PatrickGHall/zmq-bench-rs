@@ -9,7 +9,7 @@ use crate::roles::{Pattern, cleanup_ipc, launch_dealer, launch_dealerrouter, lau
 use crate::zmq_helpers::{
     collect_and_append_result, get_tsc_per_ns, print_per_item_stats, SyncPhase,
     cleanup_dirty_state, assign_next_cpu, pin_current_thread_to_cpu,
-    context, init_context,
+    context, init_context, ThroughputSample,
 };
 
 // fatal + dirty cleanup on early exit: ensures no stale ipc left that would hang future runs.
@@ -205,9 +205,10 @@ async fn run_benchmark(
     };
 
     let mut histograms: Vec<Histogram<u64>> = Vec::new();
+    let mut throughput: Vec<ThroughputSample> = Vec::new();
     for task in hist_tasks {
         match task.await {
-            Ok(Ok(h)) => histograms.push(h),
+            Ok(Ok((h, s))) => { histograms.push(h); throughput.push(s); }
             Ok(Err(e)) => fatal("Receiver/dealer task failed", e),
             Err(e) => fatal("Task join error (hist)", e),
         }
@@ -226,7 +227,7 @@ async fn run_benchmark(
     }
 
     sync.print(tsc_per_ns);
-    collect_and_append_result(pattern.name(), &transport.to_uppercase(), payload_size, histograms)?;
+    collect_and_append_result(pattern.name(), &transport.to_uppercase(), payload_size, histograms, throughput)?;
 
     println!("{} benchmark complete!", pattern.name());
     Ok(())

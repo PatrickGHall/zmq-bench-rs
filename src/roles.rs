@@ -3,7 +3,7 @@ use crate::zmq_helpers::{
     finalize_measurements, hwm, BoxError, JoinResultExt, ZmqResultExt,
     BEGIN_BENCHMARK_MARKER, HELLO_MARKER, SyncPhase, compute_hot_loop_timeout,
     make_socket, register_dirty_state, cleanup_dirty_state,
-    record_first_hello, record_bench_start, read_leading_u64,
+    record_first_hello, record_bench_start, read_leading_u64, context, ThroughputSample,
 };
 
 /// Build a ZMQ endpoint for the chosen transport: an IPC socket file under /tmp
@@ -35,8 +35,8 @@ fn end_barrier_wait_bounded(b: &Barrier) {
     });
 }
 
-/// A task producing one receiver's latency histogram.
-type HistTask = JoinHandle<Result<Histogram<u64>, BoxError>>;
+/// A task producing one receiver's latency histogram and throughput sample.
+type HistTask = JoinHandle<Result<(Histogram<u64>, ThroughputSample), BoxError>>;
 /// A task that only needs to run to completion (sender / router).
 type CompletionTask = JoinHandle<Result<(), BoxError>>;
 /// Tasks launched for one benchmark: histogram producers and completion-only tasks.
@@ -135,7 +135,7 @@ pub(crate) async fn run_subscriber(
     payload_size: usize,
     hello_ack_tx: Option<oneshot::Sender<()>>,
     begin_ack_tx: Option<oneshot::Sender<()>>,
-) -> Result<Histogram<u64>, BoxError> {
+) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     let transport = addresses.first().map(|a| transport_label(a)).unwrap_or("TCP");
     let addrs = addresses.clone();
     let handle = spawn_measurement_receiver(
@@ -203,7 +203,7 @@ pub(crate) async fn run_receiver(
     num_messages: usize,
     bind_address: String,
     hello_ack_tx: Option<oneshot::Sender<()>>,
-) -> Result<Histogram<u64>, BoxError> {
+) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     let transport = transport_label(&bind_address);
     let addr = bind_address.clone();
     let addr_for_remove = addr.clone();
@@ -244,7 +244,7 @@ pub(crate) async fn run_dealer(
     bench_phase: Option<Arc<AtomicBool>>,
     sync: SyncPhase,
     end_barrier: Arc<Barrier>,
-) -> Result<Histogram<u64>, BoxError> {
+) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     // Each dealer owns a sender (id 2k) and a receiver (id 2k+1) and forwards to
     // the next dealer's receiver, forming a ring through the router.
     let sender_id = dealer_id * 2;
@@ -621,7 +621,7 @@ fn spawn_measurement_receiver(
     payload_size: usize,
     num_messages: usize,
     warn_short: bool,
-) -> JoinHandle<Result<Histogram<u64>, BoxError>> {
+) -> JoinHandle<Result<(Histogram<u64>, ThroughputSample), BoxError>> {
     tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
             maybe_pin_for_bench();
@@ -644,14 +644,17 @@ fn spawn_measurement_receiver(
             let hot_ms = compute_hot_loop_timeout(num_messages, payload_size).as_millis() as i32;
             socket.set_rcvtimeo(hot_ms).box_err()?;
 
-            let received = hot_recv_tsc(&socket, &mut recv_buffer, &mut latencies, &mut recv_cpus, num_messages)?;
+            let (received, span_tsc) = hot_recv_tsc(
+                &socket, &mut recv_buffer, &mut latencies, &mut recv_cpus,
+                num_messages, context().save_hists,
+            )?;
 
             if let Some(b) = barrier {
                 end_barrier_wait_bounded(&b);
             }
 
-            let (histogram, _) = finalize_measurements(
-                latencies, recv_cpus, pattern, transport, payload_size,
+            let (histogram, sample) = finalize_measurements(
+                latencies, recv_cpus, span_tsc, pattern, transport, payload_size,
             )?;
 
             if warn_short {
@@ -662,7 +665,7 @@ fn spawn_measurement_receiver(
                 maybe_remove_ipc(&addr);
             }
 
-            Ok(histogram)
+            Ok((histogram, sample))
         })
         .await
         .join_err()
@@ -772,6 +775,13 @@ fn hot_send_tsc_multipart(socket: &zmq::Socket, dest: &[u8], buf: &mut [u8], n: 
 /// back-to-back empty windows.
 const HOT_RECV_MAX_IDLE_WINDOWS: u32 = 2;
 
+/// Receive `n` messages, recording each one's latency. Returns the count
+/// received and the TSC span from the first to the last receive (for throughput).
+///
+/// The hot loop is kept minimal so the receiver keeps pace with the sender: any
+/// asymmetric per-message work here lets the send-side queue grow and inflates
+/// measured latency. sched_getcpu() is therefore only sampled when `collect_cpus`
+/// (i.e. --save-hists) needs it for core-correlation.
 #[inline(always)]
 fn hot_recv_tsc(
     socket: &zmq::Socket,
@@ -779,20 +789,24 @@ fn hot_recv_tsc(
     latencies: &mut Vec<u64>,
     cpus: &mut Vec<i32>,
     n: usize,
-) -> Result<usize, BoxError> {
+    collect_cpus: bool,
+) -> Result<(usize, u64), BoxError> {
     let mut received = 0;
     let mut idle = 0u32;
-    // Wait for exactly `n` messages. A recvtimeo expiry (EAGAIN) is a transient
-    // gap, not end-of-stream — retry until `n` arrive or we see too many empty
-    // windows in a row (true stall). Breaking on the first gap used to abandon
-    // the stream mid-flight and deadlock the router on the end barrier.
+    let (mut first_tsc, mut last_tsc) = (0u64, 0u64);
+    // A recvtimeo expiry (EAGAIN) is a transient gap, not end-of-stream — retry
+    // until `n` arrive or too many empty windows in a row (true stall). Breaking
+    // on the first gap used to abandon the stream and deadlock the end barrier.
     while received < n {
         match socket.recv_into(buf, 0) {
             Ok(_) => {
                 let recv_tsc = unsafe { _rdtsc() };
-                let sent_tsc = read_leading_u64(buf);
-                latencies.push(recv_tsc - sent_tsc);
-                unsafe { cpus.push(libc::sched_getcpu()); }
+                if received == 0 { first_tsc = recv_tsc; }
+                last_tsc = recv_tsc;
+                latencies.push(recv_tsc - read_leading_u64(buf));
+                if collect_cpus {
+                    unsafe { cpus.push(libc::sched_getcpu()); }
+                }
                 received += 1;
                 idle = 0;
             }
@@ -805,5 +819,5 @@ fn hot_recv_tsc(
             Err(_) => break,
         }
     }
-    Ok(received)
+    Ok((received, last_tsc.saturating_sub(first_tsc)))
 }
