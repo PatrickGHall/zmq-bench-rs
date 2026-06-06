@@ -332,6 +332,7 @@ pub fn print_per_item_stats(label: &str, histograms: &[Histogram<u64>]) {
 pub fn maybe_save_individual_hist(
     pattern: &str,
     transport: &str,
+    mode: &str,
     payload_size: usize,
     histogram: &Histogram<u64>,
     latencies_ns: &[u64],
@@ -340,9 +341,10 @@ pub fn maybe_save_individual_hist(
     if context().save_hists {
         let save_id = next_save_id();
         let prefix = format!(
-            "indiv_{}_{}_{}_{}_{}",
+            "indiv_{}_{}_{}_{}_{}_{}",
             pattern,
             transport,
+            mode,
             payload_size,
             std::process::id(),
             save_id
@@ -438,6 +440,7 @@ pub fn finalize_measurements(
     recv_span_tsc: u64,
     pattern: &str,
     transport: &str,
+    mode: &str,
     payload_size: usize,
 ) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     let received = latencies.len();
@@ -452,7 +455,7 @@ pub fn finalize_measurements(
         histogram.record(latency_ns)?;
     }
 
-    maybe_save_individual_hist(pattern, transport, payload_size, &histogram, &latencies_ns, &recv_cpus);
+    maybe_save_individual_hist(pattern, transport, mode, payload_size, &histogram, &latencies_ns, &recv_cpus);
 
     let span_ns = (recv_span_tsc as f64 / tsc_per_ns) as u64;
     Ok((histogram, ThroughputSample { received, span_ns }))

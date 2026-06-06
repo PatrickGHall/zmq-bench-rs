@@ -187,6 +187,7 @@ pub(crate) async fn run_subscriber(
     payload_size: usize,
     hello_ack_tx: Option<oneshot::Sender<()>>,
     begin_ack_tx: Option<oneshot::Sender<()>>,
+    mode: Mode,
 ) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     let transport = addresses.first().map(|a| transport_label(a)).unwrap_or("TCP");
     let addrs = addresses.clone();
@@ -208,6 +209,7 @@ pub(crate) async fn run_subscriber(
         None,
         "PubSub",
         transport,
+        mode.as_str(),
         payload_size,
         num_messages,
         true,
@@ -288,6 +290,7 @@ pub(crate) async fn run_receiver(
         Some(addr_for_remove),
         "Dealer",
         transport,
+        mode.as_str(),
         payload_size,
         num_messages,
         true,
@@ -348,6 +351,7 @@ pub(crate) async fn run_dealer(
         None,
         "DealerRouter",
         transport,
+        mode.as_str(),
         payload_size,
         num_messages,
         true,
@@ -501,7 +505,7 @@ pub(crate) fn launch_pubsub(
 
             let value = address.clone();
             hist_tasks.push(tokio::spawn(async move {
-                run_subscriber(vec![value.clone()], num_messages, payload_size, Some(h_tx), Some(b_tx)).await
+                run_subscriber(vec![value.clone()], num_messages, payload_size, Some(h_tx), Some(b_tx), mode).await
             }));
         }
 
@@ -708,6 +712,7 @@ fn spawn_measurement_receiver(
     remove_addr: Option<String>,
     pattern: &'static str,
     transport: &'static str,
+    mode: &'static str,
     payload_size: usize,
     num_messages: usize,
     warn_short: bool,
@@ -745,7 +750,7 @@ fn spawn_measurement_receiver(
             }
 
             let (histogram, sample) = finalize_measurements(
-                latencies, recv_cpus, span_tsc, pattern, transport, payload_size,
+                latencies, recv_cpus, span_tsc, pattern, transport, mode, payload_size,
             )?;
 
             if warn_short {
