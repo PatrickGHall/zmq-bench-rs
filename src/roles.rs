@@ -6,6 +6,20 @@ use crate::zmq_helpers::{
     record_first_hello, record_bench_start, extract_timestamp,
 };
 
+/// Wait on the end barrier with an upper bound. The barrier rendezvous (router
+/// finished forwarding <-> dealers finished receiving) completes in microseconds
+/// on a healthy run; the timeout is a safety net so a partner that died without
+/// arriving turns into a clean teardown rather than a permanent hang.
+const END_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn end_barrier_wait_bounded(b: &Barrier) {
+    Handle::current().block_on(async {
+        if tokio::time::timeout(END_BARRIER_TIMEOUT, b.wait()).await.is_err() {
+            eprintln!("warning: end barrier timed out after {:?} (partner did not arrive)", END_BARRIER_TIMEOUT);
+        }
+    });
+}
+
 #[derive(Clone)]
 pub(crate) struct SyncHandles {
     pub first: Arc<AtomicU64>,
@@ -103,7 +117,6 @@ pub(crate) async fn run_publisher(
         sh,
         reals_start_rx,
         |s, b, _ack| s.send(&b[..], 0).box_err(),
-        |s, b, _ack| s.send(&b[..], 0).box_err(),
         move |s, b| hot_send_tsc(s, b, n),
         Some(addr_for_remove),
     );
@@ -169,11 +182,6 @@ pub(crate) async fn run_sender(
         bench_phase,
         sh,
         None,
-        |s, b, ack| {
-            s.send(&b[..], 0).box_err()?;
-            s.recv_into(ack, 0).box_err()?;
-            Ok(())
-        },
         |s, b, ack| {
             s.send(&b[..], 0).box_err()?;
             s.recv_into(ack, 0).box_err()?;
@@ -260,7 +268,7 @@ pub(crate) async fn run_dealer(
         if raddr_for_recv.starts_with("ipc") { "IPC" } else { "TCP" },
         payload_size,
         num_messages,
-        false,
+        true,
     );
 
     let first_send = sync.first.clone();
@@ -282,14 +290,6 @@ pub(crate) async fn run_dealer(
         bench_phase,
         sh,
         None,
-        {
-            let d = dest.clone();
-            move |s, b, _ack| {
-                s.send(&d, zmq::SNDMORE).box_err()?;
-                s.send(&b[..], 0).box_err()?;
-                Ok(())
-            }
-        },
         {
             let d = dest.clone();
             move |s, b, _ack| {
@@ -324,6 +324,11 @@ pub(crate) async fn run_router(
             Some(total),
             None,
         )?;
+        // Mandatory delivery turns the default lossy ROUTER behaviour into
+        // explicit EAGAIN (peer pipe full) / EHOSTUNREACH (peer not yet
+        // connected) errors, so the forward loop can apply backpressure instead
+        // of silently dropping measured messages.
+        router.set_router_mandatory(true).box_err()?;
         router.bind(&bind_address).box_err()?;
         register_dirty_state(&bind_address);
 
@@ -336,17 +341,55 @@ pub(crate) async fn run_router(
             let payload = router.recv_msg(0).box_err()?;
 
             let is_control = is_hello_marker(payload.as_ref()) || is_begin_marker(payload.as_ref());
-            router.send(dest, zmq::SNDMORE).box_err()?;
-            router.send(payload, 0).box_err()?;
+            router_forward_reliable(&router, &dest, &payload)?;
             if !is_control { forwarded += 1; }
         }
-
-        Handle::current().block_on(end_barrier.wait());
+        end_barrier_wait_bounded(&end_barrier);
         maybe_remove_ipc(&bind_address);
         Ok(())
     })
     .await
     .join_err()
+}
+
+/// Deadline for the router to keep retrying a forward before declaring the path
+/// dead. Healthy forwards succeed immediately (or after a sub-ms connection
+/// window); this only bounds a genuinely dead peer so it errors instead of
+/// hanging. Kept short so failures surface fast rather than masking a problem.
+const ROUTER_FORWARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Forward `[dest, payload]` through a ROUTER set to mandatory mode, retrying
+/// transient conditions instead of dropping. The routing/HWM decision is taken
+/// on the first (identity) frame, so we retry there: once `dest` is accepted the
+/// message is committed to that peer's pipe and the payload frame follows.
+///
+///   * EAGAIN       — peer pipe at HWM; spin until the receiver drains (backpressure).
+///   * EHOSTUNREACH — peer not connected yet (startup race); spin until it appears.
+///
+/// A bounded deadline turns a genuinely dead peer into a clear error rather than
+/// an unbounded hang.
+fn router_forward_reliable(router: &zmq::Socket, dest: &zmq::Message, payload: &zmq::Message)
+    -> Result<(), BoxError>
+{
+    let start = std::time::Instant::now();
+    loop {
+        match router.send(&dest[..], zmq::SNDMORE) {
+            Ok(()) => {
+                router.send(&payload[..], 0).box_err()?;
+                return Ok(());
+            }
+            Err(zmq::Error::EAGAIN) | Err(zmq::Error::EHOSTUNREACH)
+                if start.elapsed() < ROUTER_FORWARD_DEADLINE =>
+            {
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("router forward failed (peer unreachable for {:?}): {}",
+                        start.elapsed(), e),
+            ))),
+        }
+    }
 }
 
 
@@ -527,8 +570,30 @@ fn drain_sync_phase(
     mut begin_ack: Option<oneshot::Sender<()>>,
     reply_buffer: Option<&[u8]>,
 ) -> Result<(), BoxError> {
+    let mut eagain_retries = 0;
     loop {
-        socket.recv_into(buffer, 0).box_err()?;
+        match socket.recv_into(buffer, 0) {
+            Ok(_) => {}
+            // A slow partner (still binding/connecting/pinning) yields EAGAIN after
+            // the short rcvtimeo. Retry up to a bounded budget rather than treating
+            // the first 2s gap as fatal — the previous code crashed (~25% of runs)
+            // here under startup contention. A genuine hang still surfaces quickly.
+            Err(zmq::Error::EAGAIN) if eagain_retries < HELLO_DRAIN_MAX_EAGAIN => {
+                eagain_retries += 1;
+                continue;
+            }
+            Err(zmq::Error::EAGAIN) => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "sync handshake stalled: no marker after {} x {}ms",
+                        HELLO_DRAIN_MAX_EAGAIN + 1, HELLO_DRAIN_RCVTIMEO_MS
+                    ),
+                )));
+            }
+            Err(e) => return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other, e.to_string()))),
+        }
         if is_hello_marker(buffer) {
             if let Some(tx) = hello_ack.take() {
                 let _ = tx.send(());
@@ -555,7 +620,9 @@ fn drain_sync_phase(
     Ok(())
 }
 
-const HELLO_DRAIN_RCVTIMEO_MS: i32 = 2000; // short fixed: hello/BEGIN sync phase is independent of bench params (N/payload); longer values masked hangs in prior versions
+const HELLO_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1); // throttle sync-phase HELLO resends (non-measured phase)
+const HELLO_DRAIN_RCVTIMEO_MS: i32 = 1000; // sync phase is sub-ms healthy; one expired window already signals a setup problem
+const HELLO_DRAIN_MAX_EAGAIN: u32 = 1; // tolerate a single slow window, then fail fast (~2s total) for quick debugging
 
 fn spawn_measurement_receiver(
     hello_ack_tx: Option<oneshot::Sender<()>>,
@@ -595,7 +662,7 @@ fn spawn_measurement_receiver(
             let received = hot_recv_tsc(&socket, &mut recv_buffer, &mut latencies, &mut recv_cpus, num_messages)?;
 
             if let Some(b) = barrier {
-                Handle::current().block_on(b.wait());
+                end_barrier_wait_bounded(&b);
             }
 
             let (histogram, _) = finalize_measurements(
@@ -623,8 +690,9 @@ fn spawn_measurement_sender(
     bench_phase: Option<Arc<AtomicBool>>,
     sync: SyncHandles,
     reals_start_rx: Option<oneshot::Receiver<()>>,
-    hello_action: impl Fn(&zmq::Socket, &mut [u8], &mut [u8]) -> Result<(), BoxError> + Send + 'static,
-    begin_action: impl Fn(&zmq::Socket, &mut [u8], &mut [u8]) -> Result<(), BoxError> + Send + 'static,
+    // Same action drives both sync markers (HELLO and BEGIN): send the framed
+    // buffer and, for request/reply patterns, consume the ack.
+    sync_action: impl Fn(&zmq::Socket, &mut [u8], &mut [u8]) -> Result<(), BoxError> + Send + 'static,
     hot_action: impl Fn(&zmq::Socket, &mut [u8]) -> Result<(), BoxError> + Send + 'static,
     remove_addr: Option<String>,
 ) -> JoinHandle<Result<(), BoxError>> {
@@ -637,17 +705,27 @@ fn spawn_measurement_sender(
             let mut ack_buf = vec![0u8; 8];
             let handle = Handle::current();
 
+            // Synchronization phase: resend HELLO until the coordinator flips
+            // bench_phase (every receiver has seen a HELLO and acked). Repetition
+            // is required because PUB/SUB drops messages sent before the subscriber
+            // finishes connecting (slow-joiner). Throttled to once per millisecond
+            // so the resend can't flood the send-HWM ahead of bench_phase (an
+            // unthrottled loop pushed tens of thousands of HELLOs and stalled
+            // forwarding); a healthy handshake completes in a handful of HELLOs.
+            buf[0..8].copy_from_slice(&0u64.to_le_bytes());
             loop {
-                buf[0..8].copy_from_slice(&0u64.to_le_bytes());
                 record_first_hello(Some(&sync.first));
-                hello_action(&socket, &mut buf, &mut ack_buf)?;
-                if let Some(phase) = &bench_phase {
-                    if phase.load(Ordering::Acquire) { break; }
-                } else { break; }
+                sync_action(&socket, &mut buf, &mut ack_buf)?;
+                match &bench_phase {
+                    Some(phase) if !phase.load(Ordering::Acquire) => {
+                        std::thread::sleep(HELLO_RESEND_INTERVAL);
+                    }
+                    _ => break,
+                }
             }
 
             buf[0..8].copy_from_slice(&BEGIN_BENCHMARK_MARKER.to_le_bytes());
-            begin_action(&socket, &mut buf, &mut ack_buf)?;
+            sync_action(&socket, &mut buf, &mut ack_buf)?;
 
             record_bench_start(Some(&sync.last));
             if let Some(rx) = reals_start_rx {
@@ -701,6 +779,13 @@ fn hot_send_tsc_multipart(socket: &zmq::Socket, dest: &[u8], buf: &mut [u8], n: 
     Ok(())
 }
 
+/// Consecutive idle `recvtimeo` windows tolerated before declaring the stream
+/// stalled. The reliable router never drops, so the receiver should always reach
+/// `n` with messages flowing continuously; a transient scheduling gap merely
+/// yields one empty window and we retry. Only a genuine hang produces this many
+/// back-to-back empty windows.
+const HOT_RECV_MAX_IDLE_WINDOWS: u32 = 2;
+
 #[inline(always)]
 fn hot_recv_tsc(
     socket: &zmq::Socket,
@@ -710,7 +795,12 @@ fn hot_recv_tsc(
     n: usize,
 ) -> Result<usize, BoxError> {
     let mut received = 0;
-    for _ in 0..n {
+    let mut idle = 0u32;
+    // Wait for exactly `n` messages. A recvtimeo expiry (EAGAIN) is a transient
+    // gap, not end-of-stream — retry until `n` arrive or we see too many empty
+    // windows in a row (true stall). Breaking on the first gap used to abandon
+    // the stream mid-flight and deadlock the router on the end barrier.
+    while received < n {
         match socket.recv_into(buf, 0) {
             Ok(_) => {
                 let recv_tsc = unsafe { _rdtsc() };
@@ -718,6 +808,13 @@ fn hot_recv_tsc(
                 latencies.push(recv_tsc - sent_tsc);
                 unsafe { cpus.push(libc::sched_getcpu()); }
                 received += 1;
+                idle = 0;
+            }
+            Err(zmq::Error::EAGAIN) => {
+                idle += 1;
+                if idle >= HOT_RECV_MAX_IDLE_WINDOWS {
+                    break;
+                }
             }
             Err(_) => break,
         }

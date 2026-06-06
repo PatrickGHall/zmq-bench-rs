@@ -111,6 +111,9 @@ pub struct Context {
     // --- Mutable runtime state (thread-safe) ---
     save_counter: AtomicUsize,
     next_cpu: AtomicUsize,
+    /// Physical CPU count captured once at startup, before any thread pins
+    /// itself. Used as the fixed round-robin modulus in assign_next_cpu.
+    total_cpus: usize,
     dirty_state: std::sync::Mutex<Vec<String>>,
 }
 
@@ -125,6 +128,7 @@ pub fn init_context(save_hists: bool, output: String) {
         tsc_per_ns: OnceLock::new(),
         save_counter: AtomicUsize::new(0),
         next_cpu: AtomicUsize::new(0),
+        total_cpus: num_cpus::get().max(1),
         dirty_state: std::sync::Mutex::new(Vec::new()),
     };
     let _ = CONTEXT.set(ctx);
@@ -187,9 +191,16 @@ impl Context {
         self.save_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Round-robin a distinct CPU for the calling thread.
+    ///
+    /// Uses `total_cpus` captured once at startup rather than a live
+    /// `num_cpus::get()`: the latter is affinity-aware, so once any thread pins
+    /// itself to a single core that 1-CPU mask is inherited by child threads and
+    /// `num_cpus::get()` would return 1 — collapsing every later assignment onto
+    /// core 0 (`raw % 1`). The fixed modulus keeps assignments spread across all
+    /// physical cores.
     pub fn assign_next_cpu(&self) -> usize {
-        let n = num_cpus::get().max(1);
-        self.next_cpu.fetch_add(1, Ordering::Relaxed) % n
+        self.next_cpu.fetch_add(1, Ordering::Relaxed) % self.total_cpus
     }
 
     pub fn register_dirty_state(&self, addr: &str) {
