@@ -5,7 +5,7 @@ use tokio::runtime::Builder;
 mod roles;
 mod zmq_helpers;
 
-use crate::roles::{Pattern, cleanup_ipc, launch_dealer, launch_dealerrouter, launch_pubsub};
+use crate::roles::{Mode, Pattern, cleanup_ipc, launch_dealer, launch_dealerrouter, launch_pubsub};
 use crate::zmq_helpers::{
     collect_and_append_result, get_tsc_per_ns, print_per_item_stats, SyncPhase,
     cleanup_dirty_state, assign_next_cpu, pin_current_thread_to_cpu,
@@ -45,6 +45,9 @@ struct CommonArgs {
 
     #[clap(long, default_value = "ipc")]
     pub transport: String,
+
+    #[clap(long, default_value = "throughput", help = "throughput | latency")]
+    pub mode: Mode,
 
     #[clap(long)]
     pub save_hists: bool,
@@ -123,19 +126,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 num_receivers_per_sender: a.num_receivers_per_sender,
             };
             let total = a.num_senders * (1 + a.num_receivers_per_sender);
-            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total)?;
+            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total, a.common.mode)?;
         }
         Command::DealerBenchmark(a) => {
             init_context(a.common.save_hists, a.common.output);
             let p = Pattern::Dealer { num_pairs: a.num_pairs };
             let total = a.num_pairs * 2;
-            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total)?;
+            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total, a.common.mode)?;
         }
         Command::DealerRouterBenchmark(a) => {
             init_context(a.common.save_hists, a.common.output);
             let p = Pattern::DealerRouter { num_dealers: a.num_dealers };
             let total = a.num_dealers * 2 + 1;
-            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total)?;
+            run_bench_with_pattern(p, a.common.transport, a.common.payload_size, a.common.num_messages, total, a.common.mode)?;
         }
         Command::RunBenchmarks(args) => {
             init_context(args.save_hists, args.output.clone());
@@ -167,10 +170,11 @@ fn run_bench_with_pattern(
     payload_size: usize,
     num_messages: usize,
     total_tasks_hint: usize,
+    mode: Mode,
 ) -> Result<(), Box<dyn Error>> {
     let threads = total_tasks_hint.min(num_cpus::get());
     let rt = build_bench_runtime(threads)?;
-    rt.block_on(run_benchmark(p, transport, payload_size, num_messages))
+    rt.block_on(run_benchmark(p, transport, payload_size, num_messages, mode))
 }
 
 async fn run_benchmark(
@@ -178,6 +182,7 @@ async fn run_benchmark(
     transport: String,
     payload_size: usize,
     num_messages: usize,
+    mode: Mode,
 ) -> Result<(), Box<dyn Error>> {
     println!("{}", pattern.start_message());
 
@@ -189,17 +194,17 @@ async fn run_benchmark(
         Pattern::PubSub { num_senders, num_receivers_per_sender } => {
             launch_pubsub(
                 *num_senders, *num_receivers_per_sender,
-                &transport, payload_size, num_messages, &sync,
+                &transport, payload_size, num_messages, &sync, mode,
             )
         }
         Pattern::Dealer { num_pairs } => {
             launch_dealer(
-                *num_pairs, &transport, payload_size, num_messages, &sync,
+                *num_pairs, &transport, payload_size, num_messages, &sync, mode,
             )
         }
         Pattern::DealerRouter { num_dealers } => {
             launch_dealerrouter(
-                *num_dealers, &transport, payload_size, num_messages, &sync,
+                *num_dealers, &transport, payload_size, num_messages, &sync, mode,
             )
         }
     };
@@ -227,7 +232,7 @@ async fn run_benchmark(
     }
 
     sync.print(tsc_per_ns);
-    collect_and_append_result(pattern.name(), &transport.to_uppercase(), payload_size, histograms, throughput)?;
+    collect_and_append_result(pattern.name(), &transport.to_uppercase(), mode.as_str(), payload_size, histograms, throughput)?;
 
     println!("{} benchmark complete!", pattern.name());
     Ok(())
@@ -274,27 +279,29 @@ async fn run_benchmarks(args: RunBenchmarksArgs) -> Result<(), Box<dyn Error>> {
     for (label, pattern) in sections {
         println!("=== {} Benchmarks ===", label);
         for transport in ["ipc", "tcp"] {
-            for &size in &args.payload_sizes {
-                let do_cleanup = || {
-                    if transport == "ipc" {
-                        let (prefix, count) = match *label {
-                            "PUB/SUB" => ("pub", args.num_senders),
-                            "DEALER" => ("dealer", args.num_dealer_pairs),
-                            "DEALER-ROUTER" => ("dealerrouter", 0),
-                            _ => ("", 0),
-                        };
-                        cleanup_ipc(prefix, count);
-                    }
-                };
-                do_cleanup();
+            for mode in [Mode::Throughput, Mode::Latency] {
+                for &size in &args.payload_sizes {
+                    let do_cleanup = || {
+                        if transport == "ipc" {
+                            let (prefix, count) = match *label {
+                                "PUB/SUB" => ("pub", args.num_senders),
+                                "DEALER" => ("dealer", args.num_dealer_pairs),
+                                "DEALER-ROUTER" => ("dealerrouter", 0),
+                                _ => ("", 0),
+                            };
+                            cleanup_ipc(prefix, count);
+                        }
+                    };
+                    do_cleanup();
 
-                println!("Running {} {} - Payload: {} bytes", label, transport.to_uppercase(), size);
-                run_benchmark(pattern.clone(), transport.to_string(), size, args.num_messages).await?;
+                    println!("Running {} {} {} - Payload: {} bytes", label, transport.to_uppercase(), mode.as_str(), size);
+                    run_benchmark(pattern.clone(), transport.to_string(), size, args.num_messages, mode).await?;
 
-                do_cleanup();
+                    do_cleanup();
 
-                println!("  Completed {} {} - Payload: {} bytes", label, transport.to_uppercase(), size);
-                println!();
+                    println!("  Completed {} {} {} - Payload: {} bytes", label, transport.to_uppercase(), mode.as_str(), size);
+                    println!();
+                }
             }
         }
     }

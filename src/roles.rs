@@ -4,6 +4,7 @@ use crate::zmq_helpers::{
     BEGIN_BENCHMARK_MARKER, HELLO_MARKER, SyncPhase, compute_hot_loop_timeout,
     make_socket, register_dirty_state, cleanup_dirty_state,
     record_first_hello, record_bench_start, read_leading_u64, context, ThroughputSample,
+    get_tsc_per_ns,
 };
 
 /// Build a ZMQ endpoint for the chosen transport: an IPC socket file under /tmp
@@ -41,6 +42,50 @@ type HistTask = JoinHandle<Result<(Histogram<u64>, ThroughputSample), BoxError>>
 type CompletionTask = JoinHandle<Result<(), BoxError>>;
 /// Tasks launched for one benchmark: histogram producers and completion-only tasks.
 type LaunchedTasks = (Vec<HistTask>, Vec<CompletionTask>);
+
+/// Sends one received message back to its origin, used only in latency mode to
+/// lock-step the sender (keeping the queue empty so latency reflects transit).
+type EchoFn = Box<dyn Fn(&zmq::Socket, &[u8]) -> Result<(), BoxError> + Send>;
+
+/// What a benchmark measures.
+///
+///   * `Throughput` — sender blasts all N messages; the deep send queue means the
+///     recorded latency is dominated by queue residence (Little's law), so this
+///     mode is about messages/second.
+///   * `Latency` — the offered load is held low so the queue stays empty and the
+///     recorded latency is true one-way transit. Dealer/DealerRouter use a
+///     lock-step ping-pong (sender waits for an echo); PUB/SUB has no back channel
+///     so its sender is rate-paced instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mode {
+    Throughput,
+    Latency,
+}
+
+impl Mode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Mode::Throughput => "throughput",
+            Mode::Latency => "latency",
+        }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "throughput" | "tput" => Ok(Mode::Throughput),
+            "latency" | "lat" => Ok(Mode::Latency),
+            other => Err(format!("unknown mode '{}' (expected throughput|latency)", other)),
+        }
+    }
+}
+
+/// Offered-load spacing for latency-mode PUB/SUB: one send per interval keeps the
+/// subscriber's queue empty (it drains far faster) so latency reflects transit,
+/// not queueing. Lock-step patterns don't need this — the echo paces them.
+const LATENCY_PACE_NS: u64 = 25_000;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Pattern {
@@ -105,10 +150,12 @@ pub(crate) async fn run_publisher(
     bench_phase: Option<Arc<AtomicBool>>,
     sync: SyncPhase,
     reals_start_rx: Option<oneshot::Receiver<()>>,
+    mode: Mode,
 ) -> Result<(), BoxError> {
     let addr = address.clone();
     let addr_for_remove = addr.clone();
     let n = num_messages;
+    let pace_ticks = (LATENCY_PACE_NS as f64 * get_tsc_per_ns()) as u64;
     let handle = spawn_measurement_sender(
         payload_size,
         move || {
@@ -123,7 +170,12 @@ pub(crate) async fn run_publisher(
         sync,
         reals_start_rx,
         |s, b, _ack| s.send(&b[..], 0).box_err(),
-        move |s, b| hot_send_tsc(s, b, n),
+        // PUB/SUB has no back channel, so latency mode rate-paces the sender
+        // rather than ping-ponging.
+        move |s, b| match mode {
+            Mode::Throughput => hot_send_tsc(s, b, n),
+            Mode::Latency => hot_send_paced(s, b, n, pace_ticks),
+        },
         Some(addr_for_remove),
     );
     handle.await.join_err()
@@ -159,6 +211,7 @@ pub(crate) async fn run_subscriber(
         payload_size,
         num_messages,
         true,
+        None,
     );
     handle.await.join_err()
 }
@@ -171,6 +224,7 @@ pub(crate) async fn run_sender(
     receiver_address: String,
     bench_phase: Option<Arc<AtomicBool>>,
     sync: SyncPhase,
+    mode: Mode,
 ) -> Result<(), BoxError> {
     let addr = receiver_address.clone();
     let n = num_messages;
@@ -192,7 +246,10 @@ pub(crate) async fn run_sender(
             s.recv_into(ack, 0).box_err()?;
             Ok(())
         },
-        move |s, b| hot_send_tsc(s, b, n),
+        move |s, b| match mode {
+            Mode::Throughput => hot_send_tsc(s, b, n),
+            Mode::Latency => hot_send_pingpong(s, None, b, n),
+        },
         None,
     );
     handle.await.join_err()
@@ -203,10 +260,17 @@ pub(crate) async fn run_receiver(
     num_messages: usize,
     bind_address: String,
     hello_ack_tx: Option<oneshot::Sender<()>>,
+    mode: Mode,
 ) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     let transport = transport_label(&bind_address);
     let addr = bind_address.clone();
     let addr_for_remove = addr.clone();
+    // Latency mode: echo each message straight back to the paired sender (direct
+    // DEALER link, no identity frame) so it can release the next one.
+    let echo: Option<EchoFn> = match mode {
+        Mode::Throughput => None,
+        Mode::Latency => Some(Box::new(|s: &zmq::Socket, buf: &[u8]| s.send(buf, 0).box_err())),
+    };
     let handle = spawn_measurement_receiver(
         hello_ack_tx,
         None,
@@ -227,6 +291,7 @@ pub(crate) async fn run_receiver(
         payload_size,
         num_messages,
         true,
+        echo,
     );
     handle.await.join_err()
 }
@@ -244,15 +309,29 @@ pub(crate) async fn run_dealer(
     bench_phase: Option<Arc<AtomicBool>>,
     sync: SyncPhase,
     end_barrier: Arc<Barrier>,
+    mode: Mode,
 ) -> Result<(Histogram<u64>, ThroughputSample), BoxError> {
     // Each dealer owns a sender (id 2k) and a receiver (id 2k+1) and forwards to
     // the next dealer's receiver, forming a ring through the router.
     let sender_id = dealer_id * 2;
     let receiver_id = dealer_id * 2 + 1;
     let target_receiver_id = ((dealer_id + 1) % num_dealers) * 2 + 1;
+    // This receiver is fed by the previous ring node's sender; latency mode
+    // echoes back to it (through the router) to lock-step that sender.
+    let predecessor_sender_id = ((dealer_id + num_dealers - 1) % num_dealers) * 2;
     let transport = transport_label(&router_address);
 
     let recv_addr = router_address.clone();
+    let echo: Option<EchoFn> = match mode {
+        Mode::Throughput => None,
+        Mode::Latency => {
+            let back = format!("dealer_{}", predecessor_sender_id).into_bytes();
+            Some(Box::new(move |s: &zmq::Socket, buf: &[u8]| {
+                s.send(&back, zmq::SNDMORE).box_err()?;
+                s.send(buf, 0).box_err()
+            }))
+        }
+    };
     let recv_handle = spawn_measurement_receiver(
         Some(hello_ack_tx),
         None,
@@ -272,6 +351,7 @@ pub(crate) async fn run_dealer(
         payload_size,
         num_messages,
         true,
+        echo,
     );
 
     let dest = format!("dealer_{}", target_receiver_id).into_bytes();
@@ -297,7 +377,10 @@ pub(crate) async fn run_dealer(
                 Ok(())
             }
         },
-        move |s, b| hot_send_tsc_multipart(s, &dest, b, n),
+        move |s, b| match mode {
+            Mode::Throughput => hot_send_tsc_multipart(s, &dest, b, n),
+            Mode::Latency => hot_send_pingpong(s, Some(&dest), b, n),
+        },
         None,
     );
 
@@ -310,6 +393,7 @@ pub(crate) async fn run_router(
     num_dealers: usize,
     num_messages_per_dealer: usize,
     end_barrier: Arc<Barrier>,
+    mode: Mode,
 ) -> Result<(), BoxError> {
     tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
         maybe_pin_for_bench();
@@ -328,10 +412,13 @@ pub(crate) async fn run_router(
         router.bind(&bind_address).box_err()?;
         register_dirty_state(&bind_address);
 
-        let total_data = num_dealers * num_messages_per_dealer;
+        // Latency mode adds a return hop (each forward is echoed back to its
+        // sender), so the router relays twice as many real messages.
+        let relays_per_message = if mode == Mode::Latency { 2 } else { 1 };
+        let expected = num_dealers * num_messages_per_dealer * relays_per_message;
         let mut forwarded = 0usize;
 
-        while forwarded < total_data {
+        while forwarded < expected {
             let _sender = router.recv_msg(0).box_err()?;
             let dest = router.recv_msg(0).box_err()?;
             let payload = router.recv_msg(0).box_err()?;
@@ -396,6 +483,7 @@ pub(crate) fn launch_pubsub(
     payload_size: usize,
     num_messages: usize,
     sync: &SyncPhase,
+    mode: Mode,
 ) -> LaunchedTasks {
     let mut hist_tasks = Vec::new();
     let mut completion_tasks = Vec::new();
@@ -430,7 +518,7 @@ pub(crate) fn launch_pubsub(
 
         let sh = sync.clone();
         completion_tasks.push(tokio::spawn(async move {
-            run_publisher(payload_size, num_messages, address.clone(), Some(bench_phase), sh, Some(reals_rx)).await
+            run_publisher(payload_size, num_messages, address.clone(), Some(bench_phase), sh, Some(reals_rx), mode).await
         }));
     }
     (hist_tasks, completion_tasks)
@@ -442,6 +530,7 @@ pub(crate) fn launch_dealer(
     payload_size: usize,
     num_messages: usize,
     sync: &SyncPhase,
+    mode: Mode,
 ) -> LaunchedTasks {
     let mut hist_tasks = Vec::new();
     let mut completion_tasks = Vec::new();
@@ -452,7 +541,7 @@ pub(crate) fn launch_dealer(
         let (hello_tx, hello_rx) = oneshot::channel();
         let value = addr.clone();
         hist_tasks.push(tokio::spawn(async move {
-            run_receiver(payload_size, num_messages, value.clone(), Some(hello_tx)).await
+            run_receiver(payload_size, num_messages, value.clone(), Some(hello_tx), mode).await
         }));
 
         let bp = Arc::new(AtomicBool::new(false));
@@ -463,7 +552,7 @@ pub(crate) fn launch_dealer(
 
         let sh = sync.clone();
         completion_tasks.push(tokio::spawn(async move {
-            run_sender(payload_size, num_messages, addr.clone(), Some(bp), sh).await
+            run_sender(payload_size, num_messages, addr.clone(), Some(bp), sh, mode).await
         }));
     }
     (hist_tasks, completion_tasks)
@@ -475,6 +564,7 @@ pub(crate) fn launch_dealerrouter(
     payload_size: usize,
     num_messages: usize,
     sync: &SyncPhase,
+    mode: Mode,
 ) -> LaunchedTasks {
     let mut hist_tasks = Vec::new();
     let mut completion_tasks = Vec::new();
@@ -485,7 +575,7 @@ pub(crate) fn launch_dealerrouter(
     {
         let b = end_barrier.clone();
         let raddr = router_addr.clone();
-        completion_tasks.push(tokio::spawn(async move { run_router(raddr, num_dealers, num_messages, b).await }));
+        completion_tasks.push(tokio::spawn(async move { run_router(raddr, num_dealers, num_messages, b, mode).await }));
     }
 
     let mut hello_acks = Vec::new();
@@ -500,7 +590,7 @@ pub(crate) fn launch_dealerrouter(
         let b = end_barrier.clone();
         let raddr2 = router_addr.clone();
         hist_tasks.push(tokio::spawn(async move {
-            run_dealer(payload_size, num_messages, raddr2, dealer_id, num_dealers, h_tx, Some(bp), sh, b).await
+            run_dealer(payload_size, num_messages, raddr2, dealer_id, num_dealers, h_tx, Some(bp), sh, b, mode).await
         }));
     }
 
@@ -621,6 +711,7 @@ fn spawn_measurement_receiver(
     payload_size: usize,
     num_messages: usize,
     warn_short: bool,
+    echo: Option<EchoFn>,
 ) -> JoinHandle<Result<(Histogram<u64>, ThroughputSample), BoxError>> {
     tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
@@ -646,7 +737,7 @@ fn spawn_measurement_receiver(
 
             let (received, span_tsc) = hot_recv_tsc(
                 &socket, &mut recv_buffer, &mut latencies, &mut recv_cpus,
-                num_messages, context().save_hists,
+                num_messages, context().save_hists, echo.as_ref(),
             )?;
 
             if let Some(b) = barrier {
@@ -750,8 +841,7 @@ fn maybe_warn_short(received: usize, expected: usize) {
 #[inline(always)]
 fn hot_send_tsc(socket: &zmq::Socket, buf: &mut [u8], n: usize) -> Result<(), BoxError> {
     for _ in 0..n {
-        let tsc = unsafe { _rdtsc() };
-        buf[0..8].copy_from_slice(&tsc.to_le_bytes());
+        stamp_tsc(buf);
         socket.send(&buf[..], 0).box_err()?;
     }
     Ok(())
@@ -760,10 +850,47 @@ fn hot_send_tsc(socket: &zmq::Socket, buf: &mut [u8], n: usize) -> Result<(), Bo
 #[inline(always)]
 fn hot_send_tsc_multipart(socket: &zmq::Socket, dest: &[u8], buf: &mut [u8], n: usize) -> Result<(), BoxError> {
     for _ in 0..n {
-        let tsc = unsafe { _rdtsc() };
-        buf[0..8].copy_from_slice(&tsc.to_le_bytes());
+        stamp_tsc(buf);
         socket.send(dest, zmq::SNDMORE).box_err()?;
         socket.send(&buf[..], 0).box_err()?;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn stamp_tsc(buf: &mut [u8]) {
+    buf[0..8].copy_from_slice(&unsafe { _rdtsc() }.to_le_bytes());
+}
+
+/// Latency-mode PUB/SUB sender: stamp + send, then busy-wait `pace_ticks` so the
+/// offered load stays well below the subscriber's drain rate (empty queue).
+#[inline(always)]
+fn hot_send_paced(socket: &zmq::Socket, buf: &mut [u8], n: usize, pace_ticks: u64) -> Result<(), BoxError> {
+    for _ in 0..n {
+        stamp_tsc(buf);
+        socket.send(&buf[..], 0).box_err()?;
+        let start = unsafe { _rdtsc() };
+        while unsafe { _rdtsc() } - start < pace_ticks {
+            std::hint::spin_loop();
+        }
+    }
+    Ok(())
+}
+
+/// Latency-mode lock-step sender: send one stamped message and block until the
+/// receiver's echo returns before sending the next. Only one message is ever in
+/// flight, so the receiver records pure transit latency. `dest` is `Some` for the
+/// DEALER/ROUTER (identity-routed) hop and `None` for the direct DEALER pair.
+#[inline(always)]
+fn hot_send_pingpong(socket: &zmq::Socket, dest: Option<&[u8]>, buf: &mut [u8], n: usize) -> Result<(), BoxError> {
+    let mut echo = vec![0u8; buf.len()];
+    for _ in 0..n {
+        stamp_tsc(buf);
+        if let Some(d) = dest {
+            socket.send(d, zmq::SNDMORE).box_err()?;
+        }
+        socket.send(&buf[..], 0).box_err()?;
+        socket.recv_into(&mut echo, 0).box_err()?;
     }
     Ok(())
 }
@@ -790,6 +917,7 @@ fn hot_recv_tsc(
     cpus: &mut Vec<i32>,
     n: usize,
     collect_cpus: bool,
+    echo: Option<&EchoFn>,
 ) -> Result<(usize, u64), BoxError> {
     let mut received = 0;
     let mut idle = 0u32;
@@ -806,6 +934,11 @@ fn hot_recv_tsc(
                 latencies.push(recv_tsc - read_leading_u64(buf));
                 if collect_cpus {
                     unsafe { cpus.push(libc::sched_getcpu()); }
+                }
+                // Latency mode: bounce the message back so the sender (which is
+                // blocked waiting for it) can release the next one.
+                if let Some(echo) = echo {
+                    echo(socket, buf)?;
                 }
                 received += 1;
                 idle = 0;

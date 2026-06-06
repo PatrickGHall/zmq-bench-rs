@@ -297,6 +297,7 @@ pub fn record_bench_start(last: &AtomicU64) {
 pub fn collect_and_append_result(
     pattern: &str,
     transport: &str,
+    mode: &str,
     payload_size_bytes: usize,
     histograms: Vec<Histogram<u64>>,
     throughput: Vec<ThroughputSample>,
@@ -313,7 +314,7 @@ pub fn collect_and_append_result(
     let msgs_per_sec = if span_ns > 0 { received as f64 * 1e9 / span_ns as f64 } else { 0.0 };
     let mb_per_sec = msgs_per_sec * payload_size_bytes as f64 / 1e6;
 
-    append_benchmark_result(pattern, transport, payload_size_bytes, &total, msgs_per_sec, mb_per_sec)
+    append_benchmark_result(pattern, transport, mode, payload_size_bytes, &total, msgs_per_sec, mb_per_sec)
 }
 
 pub fn print_per_item_stats(label: &str, histograms: &[Histogram<u64>]) {
@@ -360,6 +361,7 @@ pub fn maybe_save_individual_hist(
 struct BenchmarkResult {
     pattern: String,
     transport: String,
+    mode: String,
     payload_size_bytes: usize,
     min_latency_ns: u64,
     median_latency_ns: u64,
@@ -372,6 +374,7 @@ struct BenchmarkResult {
 pub fn append_benchmark_result(
     pattern: &str,
     transport: &str,
+    mode: &str,
     payload_size_bytes: usize,
     histogram: &Histogram<u64>,
     msgs_per_sec: f64,
@@ -380,6 +383,7 @@ pub fn append_benchmark_result(
     let result = BenchmarkResult {
         pattern: pattern.to_string(),
         transport: transport.to_string(),
+        mode: mode.to_string(),
         payload_size_bytes,
         min_latency_ns: histogram.min(),
         median_latency_ns: histogram.value_at_percentile(50.0),
@@ -399,7 +403,7 @@ pub fn append_benchmark_result(
     writer.serialize(result)?;
     writer.flush()?;
 
-    println!("Aggregated benchmark result for {}-{} ({} bytes)", pattern, transport, payload_size_bytes);
+    println!("Aggregated benchmark result for {}-{} {} ({} bytes)", pattern, transport, mode, payload_size_bytes);
     println!(
         "  stats: min={} p50={} mean={:.0} p90={} p99={} p99.9={} max={}",
         histogram.min(),
